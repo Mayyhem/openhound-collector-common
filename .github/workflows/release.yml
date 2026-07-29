@@ -1,0 +1,58 @@
+name: Build and Publish
+
+# Publishing is driven entirely by tags: `git tag v0.1.0 && git push origin v0.1.0`.
+# hatch-vcs derives the package version from that tag, so the tag IS the release —
+# there is no version to bump by hand and nothing to upload manually.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write # the OIDC token PyPI trades for a short-lived upload token
+
+jobs:
+  build:
+    # Must match the "Environment name" in the PyPI trusted-publisher config exactly.
+    # Add a required reviewer here to turn every release into a deliberate click.
+    environment: pypi
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # hatch-vcs reads git tags. A shallow clone has none, so it would silently
+          # stamp a fallback version and publish it under the wrong number — forever,
+          # since PyPI filenames are immutable.
+          fetch-depth: 0
+
+      # python-preference = "only-system" forbids uv from downloading a managed
+      # interpreter, so a Python satisfying requires-python (>=3.13) must already be on
+      # PATH before uv runs. ubuntu-latest's system Python is 3.12, and the tool-cache
+      # 3.13 is not on PATH until this step puts it there.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build package
+        run: uv build
+
+      - name: Verify the built version matches the tag
+        # Cheap insurance against the failure above: fail the job rather than burn a
+        # version number on PyPI.
+        run: |
+          set -euo pipefail
+          version="$(ls dist/*.whl | head -1 | cut -d- -f2)"
+          expected="${GITHUB_REF_NAME#v}"
+          echo "built=$version tag=$expected"
+          test "$version" = "$expected"
+
+      - name: Publish package
+        # `--trusted-publishing always` fails loudly on a misconfigured publisher
+        # instead of silently falling back to looking for an API token.
+        run: uv publish --trusted-publishing always

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # python-preference = "only-system" forbids uv from downloading an interpreter, so
+      # one satisfying requires-python (>=3.13) must already be on PATH. ubuntu-latest's
+      # system Python is 3.12.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v7
+
+      - run: uv sync --group dev
+
+      - run: uv run ruff check src tests
+
+      - run: uv run mypy src/openhound_collector_common
+
+      # The whole directory, unlike the collector's curated list: every test here runs
+      # offline with no lab and no fixture database. The one test that opens a socket
+      # binds a loopback echo server, which a runner handles fine.
+      - run: uv run pytest tests -q

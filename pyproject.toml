@@ -1,0 +1,124 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openhound-collector-common"
+# Version comes from the git tag via hatch-vcs (see [tool.hatch.version] below), so
+# `git tag v0.1.0 && git push origin v0.1.0` is the whole release. Nothing to bump by hand.
+dynamic = ["version"]
+description = "Shared pure-Python infrastructure for OpenHound on-prem/Windows-auth collectors (TDS/NTLM/Kerberos/EPA, LDAP/AD, WMI, DNS discovery, SOCKS5, DLT bridges, logging, graph stubs)"
+readme = "README.md"
+requires-python = ">=3.13,<3.15"
+authors = [
+  {name = "Chris Thompson (@_Mayyhem)", email = "cthompson@specterops.io"}
+]
+# Apache-2.0, not MIT: this library was factored out of the SCCM collector, which is a
+# port of the Apache-2.0 ConfigManBearPig.ps1. Apache-2.0 derivative work keeps its terms.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["bloodhound", "opengraph", "openhound", "ntlm", "kerberos", "epa", "ldap", "impacket"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Information Technology",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Security",
+]
+
+dependencies = [
+    # The OpenHound framework. graph/stub_node.py and graph/graph_edge.py subclass its
+    # BaseAsset and its dataclass entry models, so this library is framework-coupled in
+    # that one subpackage — declared rather than assumed. Floor matches what both
+    # collectors are validated against; no upper cap, for the same reason they have none.
+    #
+    # These three went undeclared until 2026-07-29 because the library was only ever
+    # installed into a collector's venv, which supplied them transitively. Standing alone
+    # as its own repo, `uv sync` then `pytest` failed on the missing imports.
+    "openhound>=0.2.12",
+    # Pydantic model config on those same two graph classes.
+    "pydantic>=2.0",
+    # DuckDB is the preproc lookup store; dlt/duckdb_safe.py wraps its exceptions.
+    "duckdb>=1.0",
+    # TDS, NTLMv2 (+ EPA channel-binding / SPN AV pairs), Kerberos, SPNEGO, pass-the-hash,
+    # pass-the-ticket — all pure Python, in-process. The basis of clients/mssql.py + clients/auth.py.
+    "impacket>=0.13.1",
+    # LDAP client for SPN discovery + AD object / SID resolution (clients/ad.py).
+    # 2.10.2rc4 is the first ldap3 release exporting ENCRYPT and TLS_CHANNEL_BINDING,
+    # required for NTLM sign-and-seal and LDAP channel binding against signing-required DCs.
+    "ldap3>=2.10.2rc4",
+    # DNS SRV (_ldap._tcp) + A-record DC/SPN discovery (discovery/dns.py).
+    "dnspython>=2.4.0",
+    # Kerberos ASN.1 codecs used transitively by impacket.krb5; pinned for reproducibility.
+    "pyasn1",
+    "pyasn1-modules",
+    # X.509 parsing for the tls-server-end-point channel-binding fallback (TLS 1.3 path).
+    "cryptography>=42.0.0",
+    # Windows-only current-user SSPI (passwordless SSO) + Windows SID lookup. Gated by import.
+    "pywin32>=306; sys_platform == 'win32'",
+    # Windows-only Kerberos backend for ldap3 SASL GSSAPI (bind as current user's TGT via SSPI).
+    "winkerberos>=0.10.0; sys_platform == 'win32'",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mayyhem/openhound-collector-common"
+Repository = "https://github.com/Mayyhem/openhound-collector-common"
+Issues = "https://github.com/Mayyhem/openhound-collector-common/issues"
+
+[dependency-groups]
+# This package had no dev group at all until it became its own repo: it was only ever
+# installed into the SCCM collector's venv, which supplied pytest/ruff/mypy. Standing
+# alone, it needs enough to run its own 21 test files and its own checks.
+dev = [
+    "pytest>=9.0.1",
+    # Capped below 0.16: that release widened ruff's DEFAULT rule selection well past
+    # E4/E7/E9/F, taking this package from clean to 173 findings with no code change
+    # (103 of them UP045 alone). Adopting those rules is a deliberate modernization
+    # pass, not something a fresh `uv lock` should spring on CI.
+    "ruff>=0.15.5,<0.16",
+    "mypy>=1.19.1",
+    # Type stubs for the untyped runtime deps that HAVE published stubs. impacket,
+    # openhound and sspi have none — those get ignore_missing_imports overrides in
+    # [tool.mypy] below.
+    "types-ldap3>=2.9",
+    "types-pywin32>=306",
+    "types-pyasn1>=0.6",
+]
+
+[tool.uv]
+# Never use a uv-managed (python-build-standalone) interpreter: on Windows its
+# libcrypto-3-x64.dll lacks the OPENSSL_Applink cross-CRT shim and any TLS handshake
+# aborts the process — which is every TLS-using code path in clients/ (LDAPS, TDS).
+#
+# The constraint is not Windows-only: uv may not download an interpreter anywhere, so
+# every environment must already have one satisfying requires-python (>=3.13). That is
+# why the CI and release workflows provision Python explicitly.
+python-preference = "only-system"
+
+[tool.mypy]
+enable_error_code = ["possibly-undefined"]
+
+# None of these ship a py.typed marker, so mypy can't see their signatures and reports
+# import-untyped for every module imported from them. That is a fact about those
+# distributions, not something fixable here.
+#   impacket  — the TDS/NTLM/Kerberos/DCOM stack this library is largely a wrapper around
+#   openhound — the framework (assets, progress, dataclass entry models)
+#   sspi      — pywin32's SSPI bindings for current-user Windows auth (win32 only)
+#   win32com  — pywin32's COM bindings, used by the WMI pywin32 backend
+[[tool.mypy.overrides]]
+module = ["impacket.*", "openhound.*", "sspi", "win32com.*"]
+ignore_missing_imports = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openhound_collector_common"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# PyPI rejects any version carrying a local segment (+g1a2b3c), which is exactly what
+# setuptools-scm produces by default on a non-tag commit — strip it.
+local_scheme = "no-local-version"
+# Keeps `uv build` working in a tagless or shallow checkout instead of hard-failing.
+# CI checks the built version against the tag, so a stray 0.0.0 can never be published.
+fallback_version = "0.0.0"
