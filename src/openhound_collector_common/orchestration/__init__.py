@@ -12,10 +12,11 @@ Modules:
   both stages in-process off an OpenHound app's registered hooks.
 """
 
-from .run import StagePaths, derive_stage_paths, run_end_to_end
+from .run import StagePaths, derive_stage_paths, run_end_to_end, zip_graph_output
 
 __all__ = [
     "StagePaths",
     "derive_stage_paths",
     "run_end_to_end",
+    "zip_graph_output",
 ]

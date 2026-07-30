@@ -23,6 +23,7 @@ binding, SPNEGO, LDAP, WMI, and SOCKS5 are all done in Python via `impacket` / `
 | `logging/log_context.py` | VERBOSE tier + `[target]`/`[phase]` contextvar tagging. |
 | `graph/stub_node.py`, `graph/graph_edge.py` | generic edge model + edge-endpoint stub backfill. |
 | `proxy/socks.py` | pure-Python SOCKS5 dialer. |
+| `orchestration/run.py` | After convert, `run_end_to_end` flat-zips the emitted graph `*.json` into the graph dir (name from `graph_zip_name`, default `<app.name>_collection.zip`), ready for BloodHound File Ingest (loose files kept). |
 
 ## Consumers
 

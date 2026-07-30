@@ -12,6 +12,7 @@ so ``--run-all`` and the manual three-command workflow touch identical files.
 from __future__ import annotations
 
 import logging
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 # which is the app name; `graph` is the convert output dir.
 _LOOKUP_DB_NAME = "lookup.duckdb"
 _GRAPH_DIR_NAME = "graph"
+_DEFAULT_GRAPH_ZIP_NAME = "opengraph.zip"
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,36 @@ def derive_stage_paths(app: "OpenHound", output_path: Path) -> StagePaths:
     )
 
 
+def zip_graph_output(graph_dir: Path, archive_name: str = _DEFAULT_GRAPH_ZIP_NAME) -> Optional[Path]:
+    """Bundle every *.json in *graph_dir* into a flat ``graph_dir/<archive_name>``.
+
+    The archive stores each file by basename (no directory prefix), which is exactly
+    the shape ``integration_testing.graph.load_graph`` reads back (``sorted(zf.namelist())``,
+    ``.json`` only) and BloodHound File Ingest accepts — so the operator has one
+    upload-ready artifact. The loose ``.json`` files are left in place (non-destructive),
+    and only ``*.json`` are added, so a prior archive (any ``.zip``) is never nested in.
+
+    *archive_name* is a parameter, not a constant, because this library is shared with the
+    MSSQL collector — each collector names its own archive (this one passes a timestamped
+    ``configmanbearpig_collection_<ts>.zip``). Returns the zip path, or ``None`` when there
+    is nothing to bundle (a missing dir, or a dir with no ``*.json``) — those are no-ops,
+    not errors, so a caller can call this unconditionally after convert.
+    """
+    if not graph_dir.is_dir():
+        logger.debug("Graph dir %s does not exist; no %s written.", graph_dir, archive_name)
+        return None
+    json_files = sorted(graph_dir.glob("*.json"))
+    if not json_files:
+        logger.warning("No *.json in %s; skipping %s.", graph_dir, archive_name)
+        return None
+    zip_path = graph_dir / archive_name
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in json_files:
+            zf.write(f, arcname=f.name)  # arcname = basename -> flat archive
+    logger.info("Bundled %d graph file(s) into %s", len(json_files), zip_path)
+    return zip_path
+
+
 class _NullProgress:
     """Progress stand-in whose ``.value`` is None (maps to dlt's NULL_COLLECTOR).
 
@@ -70,6 +102,7 @@ def run_end_to_end(
     output_path: Path,
     *,
     progress: "Optional[Progress]" = None,
+    graph_zip_name: Optional[str] = None,
 ) -> StagePaths:
     """Run *app*'s preproc then convert stages in-process, chained off one collect run.
 
@@ -81,6 +114,8 @@ def run_end_to_end(
     progress: a framework ``Progress`` member for a live tracker, or ``None`` for
     silent (dlt NULL_COLLECTOR). Applied per-stage because the framework stages
     consume it differently (see ``_NullProgress``).
+    graph_zip_name: basename for the bundled graph archive written into the graph
+    dir after convert; defaults to ``<app.name>_collection.zip``.
     """
     # A hook can be missing if an extension registered collect but not preproc /
     # convert; without both there is nothing to chain, so fail loudly and early
@@ -121,5 +156,8 @@ def run_end_to_end(
         progress=convert_progress,
     )
     logger.info("Convert complete. Graph written to: %s", paths.graph_out)
+    # One upload-ready archive for BloodHound File Ingest; a no-op if convert wrote no json.
+    # Collector-agnostic default name; the caller may pass a run-specific one.
+    zip_graph_output(paths.graph_out, graph_zip_name or f"{app.name}_collection.zip")
 
     return paths
