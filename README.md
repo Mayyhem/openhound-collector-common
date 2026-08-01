@@ -71,8 +71,84 @@ report regressions — each tool emits things the other does not — so a non-ze
 
 ## Developing
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) — including how to work on this library and a collector at the
-same time without reinstalling after every edit.
+You need a **system Python 3.13 or 3.14 on `PATH`**, plus [`uv`](https://docs.astral.sh/uv/).
+`pyproject.toml` sets `python-preference = "only-system"`, so uv will not download an interpreter for
+you — it fails with *"No interpreter found for Python >=3.13"* rather than fetching one. That is
+deliberate: uv's bundled CPython ships a `libcrypto` without the `OPENSSL_Applink` shim, and on Windows
+any TLS handshake — LDAPS, MSSQL TDS — aborts the process. The constraint is not Windows-only, which is
+why CI provisions Python explicitly instead of relying on the runner's default.
+
+```bash
+git clone git@github.com:Mayyhem/openhound-collector-common.git
+cd openhound-collector-common
+uv sync --group dev
+```
+
+### Run the checks
+
+These three are exactly what [`ci.yml`](.github/workflows/ci.yml) runs, so a green local run means a
+green pull request. Unlike a collector's curated subset, the whole test directory runs offline — no lab,
+no fixture database. The one test that opens a socket binds a loopback echo server.
+
+```bash
+uv run ruff check src tests
+uv run mypy src/openhound_collector_common
+uv run pytest tests -q
+```
+
+### Working on this library and a collector at once
+
+Editing here and testing there needs a live link, not a reinstall after every change. Clone the two as
+**siblings** — the path is resolved relative to the collector's `pyproject.toml`, so the layout is
+load-bearing:
+
+```
+~/Desktop/ConfigManBearPig/              a collector
+~/Desktop/openhound-collector-common/    this library
+```
+
+Then add this to the **collector's** `pyproject.toml`, immediately above `[tool.uv]`:
+
+```toml
+[tool.uv.sources]
+openhound-collector-common = { path = "../openhound-collector-common", editable = true }
+```
+
+**Do not commit that.** A committed path redirect breaks every environment without the sibling checkout,
+starting with the collector's CI, whose runner checks out that repository alone. Keep git from staging
+it, then sync:
+
+```bash
+git update-index --skip-worktree pyproject.toml
+uv sync --group dev
+```
+
+Two alternatives that look right and are not, both tested: `uv pip install -e ../openhound-collector-common`
+installs a **copy**, so your edits are invisible and the next `uv sync` silently reverts it to the
+published version; and `[sources]` in a gitignored `uv.toml` is rejected outright — *"`sources` is only
+applicable in the context of a project"*.
+
+### Releasing
+
+The tag **is** the release. `hatch-vcs` derives the package version from it, so there is no number to
+bump by hand and nothing to upload manually:
+
+```bash
+git tag -a v0.1.3 -m "what changed"
+git push origin v0.1.3
+```
+
+Pushing a `v*` tag triggers [`release.yml`](.github/workflows/release.yml), which builds, asserts the
+built version matches the tag, and publishes to PyPI through trusted publishing. The job runs in the
+`pypi` GitHub environment, so a required reviewer there turns each release into a deliberate click.
+PyPI filenames are immutable — a tag on the wrong commit burns that version number permanently.
+
+### Blast radius
+
+Two collectors consume this package, so a change here is never local to one of them. Both pin a capped
+range (`>=x.y.z,<0.2.0`), which means a patch release reaches them on their next lock refresh — not on
+publish. Treat any change to a shared signature or output format as breaking for **both**, even when the
+version number says patch.
 
 ## License
 

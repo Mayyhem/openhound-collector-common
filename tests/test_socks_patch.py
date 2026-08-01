@@ -28,7 +28,15 @@ class _Socks5EchoStub:
         self._thread.start()
 
     def _serve(self):
-        conn, _ = self._srv.accept()
+        try:
+            conn, _ = self._srv.accept()
+        except OSError:
+            # close() shut the listening socket down while we were blocked here --
+            # that is the stop signal. Without this, every test that takes the stub
+            # fixture but never connects to it (deliberately, in the loopback case)
+            # kills this thread with WinError 10038, and pytest reports the dying
+            # thread against whichever test happens to be running when it lands.
+            return
         with conn:
             # greeting: VER, NMETHODS, METHODS...
             ver, nmethods = conn.recv(2)
@@ -55,6 +63,10 @@ class _Socks5EchoStub:
 
     def close(self):
         self._srv.close()
+        # Join so teardown is deterministic: the serve thread has observed the close
+        # and exited before the next test starts, rather than dying at some later
+        # moment and being blamed on an unrelated test.
+        self._thread.join(timeout=2)
 
 
 @pytest.fixture
@@ -114,11 +126,19 @@ def test_loopback_is_not_proxied(stub):
         accepted["peer"] = True
         c.close()
 
-    threading.Thread(target=_accept, daemon=True).start()
+    accept_thread = threading.Thread(target=_accept, daemon=True)
+    accept_thread.start()
     proxy = ProxyConfig(host=stub.host, port=stub.port)
     with socks_proxy_installed(proxy):
         s = socket.create_connection(("127.0.0.1", port), timeout=5)
         s.close()
+    # create_connection returns as soon as the kernel completes the handshake, which
+    # it does from the listen backlog whether or not the accept thread has been
+    # scheduled. Join before closing and asserting: closing the listening socket
+    # first makes accept() raise instead of returning, and the assertion below then
+    # fails on a connection that was in fact delivered correctly.
+    accept_thread.join(timeout=5)
+    assert not accept_thread.is_alive(), "accept thread did not finish within 5s"
     echo.close()
     assert accepted.get("peer") is True
     assert stub.saw_domain is None  # proxy never saw the loopback connect
