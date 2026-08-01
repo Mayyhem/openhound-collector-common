@@ -105,3 +105,49 @@ def test_arr_sql_normalizes_all_shapes(con, literal, expected):
     """arr_sql turns every physical list shape into VARCHAR[]."""
     result = con.execute(f"SELECT {arr_sql(literal)}").fetchone()[0]
     assert result == expected
+
+
+# --- con-2ca2: only a MISSING SOURCE TABLE gets the quiet path ---------------
+#
+# safe_execute exists so a transform whose source table has not been collected yet
+# logs and continues -- legitimate, because privilege level decides which tables
+# exist. The risk is that the quiet path is wider than that intent: any
+# CatalogException whose message merely contains "with name X" was treated as a
+# missing source table, so a misspelled function or schema was reported as
+# "skipped (missing source)" -- a real coding error dressed as an expected absence.
+
+def test_missing_table_name_parses_a_real_missing_table():
+    from openhound_collector_common.dlt.duckdb_safe import duckdb_missing_table_name
+    assert duckdb_missing_table_name(
+        'Catalog Error: Table with name node_foo does not exist!') == "node_foo"
+
+
+def test_missing_table_name_rejects_a_missing_function():
+    """A missing scalar function is a coding error, not an uncollected source."""
+    from openhound_collector_common.dlt.duckdb_safe import duckdb_missing_table_name
+    assert duckdb_missing_table_name(
+        'Catalog Error: Scalar Function with name list_filtr does not exist!') is None
+
+
+def test_missing_table_name_rejects_a_missing_schema():
+    from openhound_collector_common.dlt.duckdb_safe import duckdb_missing_table_name
+    assert duckdb_missing_table_name(
+        'Catalog Error: Schema with name nope does not exist!') is None
+
+
+def test_catalog_error_that_is_not_a_missing_table_is_loud(con, caplog):
+    """A misspelled function must be reported as a failure, not a skipped source."""
+    import logging
+    with caplog.at_level(logging.DEBUG):
+        safe_execute(con, "bad-function", "SELECT list_filtr([1], x -> x > 0)")
+    text = caplog.text
+    assert "skipped (missing source)" not in text, text
+    assert "bad-function" in text and "failed" in text, text
+
+
+def test_missing_source_table_is_still_quiet(con, caplog):
+    """The intended quiet path is unchanged."""
+    import logging
+    with caplog.at_level(logging.DEBUG):
+        safe_execute(con, "absent-source", "SELECT * FROM s.never_collected")
+    assert "skipped (missing source)" in caplog.text, caplog.text

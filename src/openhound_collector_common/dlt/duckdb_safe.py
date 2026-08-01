@@ -69,8 +69,16 @@ def safe_execute(
         # Parse the missing table name from the message, e.g.
         # "Catalog Error: Table with name node_foo does not exist!"
         match = duckdb_missing_table_name(str(err))
+        if match is None:
+            # A catalog error that is NOT a missing source table -- a misspelled
+            # function, an absent schema, a bad sequence. Those are coding errors,
+            # so they take the loud path rather than being reported as an
+            # uncollected source. Only "this table has not been produced yet" is
+            # an expected absence; everything else is a bug worth seeing.
+            log.error("transform %r failed: %s", label, err)
+            return
         downgrade = False
-        if match and expected_miss is not None:
+        if expected_miss is not None:
             # Let the collector classify this miss as benign or not.
             try:
                 downgrade = bool(expected_miss(con, match))
@@ -98,7 +106,11 @@ def duckdb_missing_table_name(message: str) -> Optional[str]:
     """
     import re
 
-    m = re.search(r'with name "?([A-Za-z0-9_]+)"?', message)
+    # Anchored on "Table with name" deliberately. DuckDB uses the same
+    # "<thing> with name <x> does not exist!" shape for scalar functions, schemas,
+    # sequences and more, so an unanchored match reported a misspelled function as a
+    # missing source table -- turning a coding error into an expected absence.
+    m = re.search(r'Table with name "?([A-Za-z0-9_]+)"?', message)
     if m:
         return m.group(1)
     # Message in an unexpected shape — caller decides what to do with None.

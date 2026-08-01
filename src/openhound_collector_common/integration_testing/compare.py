@@ -28,121 +28,244 @@ def _values_equal(x, y) -> bool:
     return x == y
 
 
+# Absence, as distinct from a falsy collected value. 0 and False are real data a
+# collector legitimately emits; None/""/[]/{} are what a property looks like when
+# the thing that populated it stopped working.
+def _is_absent(v) -> bool:
+    return v is None or (isinstance(v, (str, list, dict, tuple)) and len(v) == 0)
+
+
+def _list_items_lost(baseline_v, candidate_v) -> list:
+    """Items present in the baseline list and missing from the candidate list.
+
+    Multiset difference over the canonical encoding, so duplicates are counted
+    rather than collapsed and ordering is irrelevant -- consistent with
+    _values_equal, which already treats lists order-insensitively.
+    """
+    if not (isinstance(baseline_v, list) and isinstance(candidate_v, list)):
+        return []
+    remaining = [_canon(i) for i in candidate_v]
+    lost = []
+    for item in baseline_v:
+        c = _canon(item)
+        if c in remaining:
+            remaining.remove(c)
+        else:
+            lost.append(item)
+    return lost
+
+
+@dataclass
+class Regression:
+    """One way the candidate has less than the baseline."""
+    category: str      # node-missing | edge-missing | property-missing |
+                       # property-emptied | property-shrank | kind-property-missing
+    key: str           # node id, "start|kind|end", or the kind name for rollup findings
+    kind: str
+    detail: str
+
+    def __str__(self) -> str:
+        # Kind-level findings carry the kind in BOTH fields (key identifies the
+        # finding, kind stays populated so callers can filter on it) -- show it
+        # once rather than printing "SCCM_Site SCCM_Site".
+        parts = [self.kind, self.key] if self.kind != self.key else [self.key]
+        where = " ".join(p for p in parts if p)
+        return f"{self.category:<22} {where}  {self.detail}"
+
+
 @dataclass
 class PropDiff:
     key: str          # node id, or "start|kind|end" for edges
     kind: str
-    only_in_a: dict = field(default_factory=dict)
-    only_in_b: dict = field(default_factory=dict)
-    changed: dict = field(default_factory=dict)   # prop -> [a_val, b_val]
+    only_in_baseline: dict = field(default_factory=dict)
+    only_in_candidate: dict = field(default_factory=dict)
+    changed: dict = field(default_factory=dict)   # prop -> {"baseline": v, "candidate": v}
 
 
 @dataclass
 class ComparisonReport:
-    nodes_only_in_a: list[str] = field(default_factory=list)
-    nodes_only_in_b: list[str] = field(default_factory=list)
-    edges_only_in_a: list[str] = field(default_factory=list)
-    edges_only_in_b: list[str] = field(default_factory=list)
+    nodes_only_in_baseline: list[str] = field(default_factory=list)
+    nodes_only_in_candidate: list[str] = field(default_factory=list)
+    edges_only_in_baseline: list[str] = field(default_factory=list)
+    edges_only_in_candidate: list[str] = field(default_factory=list)
     node_prop_diffs: list[PropDiff] = field(default_factory=list)
     edge_prop_diffs: list[PropDiff] = field(default_factory=list)
-    node_kind_rollup: dict = field(default_factory=dict)   # kind -> {only_a:[...], only_b:[...]}
+    # kind -> {only_in_baseline:[...], only_in_candidate:[...]}
+    node_kind_rollup: dict = field(default_factory=dict)
     edge_kind_rollup: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         def pd(d: PropDiff) -> dict:
-            return {"key": d.key, "kind": d.kind, "only_in_a": d.only_in_a,
-                    "only_in_b": d.only_in_b, "changed": d.changed}
+            return {"key": d.key, "kind": d.kind, "only_in_baseline": d.only_in_baseline,
+                    "only_in_candidate": d.only_in_candidate, "changed": d.changed}
         return {
-            "nodes_only_in_a": self.nodes_only_in_a, "nodes_only_in_b": self.nodes_only_in_b,
-            "edges_only_in_a": self.edges_only_in_a, "edges_only_in_b": self.edges_only_in_b,
+            "nodes_only_in_baseline": self.nodes_only_in_baseline,
+            "nodes_only_in_candidate": self.nodes_only_in_candidate,
+            "edges_only_in_baseline": self.edges_only_in_baseline,
+            "edges_only_in_candidate": self.edges_only_in_candidate,
             "node_prop_diffs": [pd(d) for d in self.node_prop_diffs],
             "edge_prop_diffs": [pd(d) for d in self.edge_prop_diffs],
             "node_kind_rollup": self.node_kind_rollup, "edge_kind_rollup": self.edge_kind_rollup,
         }
 
+    def regressions(self) -> list[Regression]:
+        """Every way the candidate has less than the baseline.
+
+        Instance-level and kind-level findings both appear: losing the only
+        instance carrying a property is reported once per instance AND once for
+        the kind, because the two answer different questions ("which node broke?"
+        versus "did this property stop being emitted at all?").
+        """
+        out: list[Regression] = []
+        for nid in self.nodes_only_in_baseline:
+            out.append(Regression("node-missing", nid, "", "in baseline, absent from candidate"))
+        for ekey in self.edges_only_in_baseline:
+            out.append(Regression("edge-missing", ekey, "", "in baseline, absent from candidate"))
+
+        for diff in (*self.node_prop_diffs, *self.edge_prop_diffs):
+            for prop in sorted(diff.only_in_baseline):
+                out.append(Regression("property-missing", diff.key, diff.kind,
+                                      f"{prop} no longer emitted"))
+            for prop in sorted(diff.changed):
+                pair = diff.changed[prop]
+                b_val, c_val = pair["baseline"], pair["candidate"]
+                if _is_absent(c_val) and not _is_absent(b_val):
+                    out.append(Regression("property-emptied", diff.key, diff.kind,
+                                          f"{prop}: {b_val!r} -> {c_val!r}"))
+                    continue
+                lost = _list_items_lost(b_val, c_val)
+                if lost:
+                    out.append(Regression("property-shrank", diff.key, diff.kind,
+                                          f"{prop}: lost {lost!r}"))
+
+        for rollup, what in ((self.node_kind_rollup, "node"), (self.edge_kind_rollup, "edge")):
+            for kind in sorted(rollup):
+                for prop in rollup[kind]["only_in_baseline"]:
+                    out.append(Regression("kind-property-missing", kind, kind,
+                                          f"{prop} on no {what} instance in the candidate"))
+        return out
+
+    @property
+    def has_regressions(self) -> bool:
+        return bool(self.regressions())
+
+    def _additions(self) -> list[str]:
+        """Everything the candidate gained. Never fails a run; always shown."""
+        out: list[str] = []
+        for nid in self.nodes_only_in_candidate:
+            out.append(f"node {nid}")
+        for ekey in self.edges_only_in_candidate:
+            out.append(f"edge {ekey}")
+        for diff in (*self.node_prop_diffs, *self.edge_prop_diffs):
+            for prop in sorted(diff.only_in_candidate):
+                out.append(f"property {diff.kind} {diff.key}.{prop}")
+        for rollup, what in ((self.node_kind_rollup, "node"), (self.edge_kind_rollup, "edge")):
+            for kind in sorted(rollup):
+                for prop in rollup[kind]["only_in_candidate"]:
+                    out.append(f"property {what} kind {kind}.{prop}")
+        return out
+
     def render(self, log: Callable[[str], None] = print) -> None:
-        log(f"Nodes only in A (current run): {len(self.nodes_only_in_a)}")
-        for nid in self.nodes_only_in_a:
-            log(f"  + {nid}")
-        log(f"Nodes only in B (compare zip): {len(self.nodes_only_in_b)}")
-        for nid in self.nodes_only_in_b:
-            log(f"  - {nid}")
-        log(f"Edges only in A: {len(self.edges_only_in_a)}   only in B: {len(self.edges_only_in_b)}")
-        for d in self.node_prop_diffs:
-            log(f"Node {d.key} [{d.kind}]: onlyA={list(d.only_in_a)} onlyB={list(d.only_in_b)} changed={d.changed}")
-        for d in self.edge_prop_diffs:
-            log(f"Edge {d.key}: onlyA={list(d.only_in_a)} onlyB={list(d.only_in_b)} changed={d.changed}")
-        log("By-kind property rollup (node kinds):")
-        for kind, roll in sorted(self.node_kind_rollup.items()):
-            if roll["only_a"] or roll["only_b"]:
-                log(f"  {kind}: only_in_A={roll['only_a']} only_in_B={roll['only_b']}")
-        log("By-kind property rollup (edge kinds):")
-        for kind, roll in sorted(self.edge_kind_rollup.items()):
-            if roll["only_a"] or roll["only_b"]:
-                log(f"  {kind}: only_in_A={roll['only_a']} only_in_B={roll['only_b']}")
+        """Print regressions first, then additions, then a one-line verdict.
+
+        Regressions lead because they are the only thing that changes the exit
+        code; additions follow so a grown graph is still reviewed rather than
+        silently accepted.
+        """
+        regs = self.regressions()
+        bar = "=" * 72
+        log(bar)
+        log(f"REGRESSIONS ({len(regs)}) -- present in baseline, missing or reduced in candidate")
+        log(bar)
+        if regs:
+            for r in regs:
+                log(f"  - {r}")
+        else:
+            log("  (none)")
+
+        adds = self._additions()
+        log(bar)
+        log(f"ADDED ({len(adds)}) -- in candidate only; review, but does not fail the run")
+        log(bar)
+        if adds:
+            for a in adds:
+                log(f"  + {a}")
+        else:
+            log("  (none)")
+
+        # Changed values that are neither a loss nor an addition: reported for
+        # context only, and deliberately not counted in either headline number.
+        changed = sum(len(d.changed) for d in (*self.node_prop_diffs, *self.edge_prop_diffs))
+        log(bar)
+        log(f"RESULT: {len(regs)} regressions, {len(adds)} additions, {changed} changed values.")
 
 
-def _diff_props(key: str, kind: str, a_props: dict, b_props: dict) -> PropDiff | None:
+def _diff_props(key: str, kind: str, baseline_props: dict, candidate_props: dict) -> PropDiff | None:
     d = PropDiff(key=key, kind=kind)
-    for k, v in a_props.items():
-        if k not in b_props:
-            d.only_in_a[k] = v
-        elif not _values_equal(v, b_props[k]):
-            d.changed[k] = [v, b_props[k]]
-    for k, v in b_props.items():
-        if k not in a_props:
-            d.only_in_b[k] = v
-    return d if (d.only_in_a or d.only_in_b or d.changed) else None
+    for k, v in baseline_props.items():
+        if k not in candidate_props:
+            d.only_in_baseline[k] = v
+        elif not _values_equal(v, candidate_props[k]):
+            d.changed[k] = {"baseline": v, "candidate": candidate_props[k]}
+    for k, v in candidate_props.items():
+        if k not in baseline_props:
+            d.only_in_candidate[k] = v
+    return d if (d.only_in_baseline or d.only_in_candidate or d.changed) else None
 
 
-def _kind_rollup(a_items: Iterable[_Item], b_items: Iterable[_Item],
+def _kind_rollup(baseline_items: Iterable[_Item], candidate_items: Iterable[_Item],
                  kinds_of: Callable[[_Item], list[str]]) -> dict:
-    """Union of property names seen per kind, separately for side A and side B.
+    """Union of property names seen per kind, separately for each side.
 
-    Plain accumulation loop (not a comprehension) so each side's dict is
-    unambiguous: no risk of a shared/rebound `side` variable silently pointing
-    both loops at the same accumulator.
+    Plain accumulation loops (not comprehensions) so each side's dict is
+    unambiguous: no risk of a shared/rebound variable silently pointing both
+    loops at the same accumulator.
     """
-    a_props: dict[str, set] = {}
-    for item in a_items:
+    baseline_props: dict[str, set] = {}
+    for item in baseline_items:
         for kind in kinds_of(item):
-            a_props.setdefault(kind, set()).update(item.properties.keys())
-    b_props: dict[str, set] = {}
-    for item in b_items:
+            baseline_props.setdefault(kind, set()).update(item.properties.keys())
+    candidate_props: dict[str, set] = {}
+    for item in candidate_items:
         for kind in kinds_of(item):
-            b_props.setdefault(kind, set()).update(item.properties.keys())
+            candidate_props.setdefault(kind, set()).update(item.properties.keys())
     roll = {}
-    for kind in set(a_props) | set(b_props):
-        pa, pb = a_props.get(kind, set()), b_props.get(kind, set())
-        roll[kind] = {"only_a": sorted(pa - pb), "only_b": sorted(pb - pa)}
+    for kind in set(baseline_props) | set(candidate_props):
+        pb, pc = baseline_props.get(kind, set()), candidate_props.get(kind, set())
+        roll[kind] = {"only_in_baseline": sorted(pb - pc), "only_in_candidate": sorted(pc - pb)}
     return roll
 
 
-def compare_graphs(a: Graph, b: Graph) -> ComparisonReport:
+def compare_graphs(baseline: Graph, candidate: Graph) -> ComparisonReport:
+    """Diff *candidate* against *baseline*. Baseline is what came first.
+
+    Membership and property differences are reported in both directions; only the
+    baseline-has/candidate-lacks direction counts as a regression (see regressions()).
+    """
     rep = ComparisonReport()
-    a_nodes = {n.id: n for n in a.nodes}
-    b_nodes = {n.id: n for n in b.nodes}
-    rep.nodes_only_in_a = sorted(set(a_nodes) - set(b_nodes))
-    rep.nodes_only_in_b = sorted(set(b_nodes) - set(a_nodes))
-    for nid in sorted(set(a_nodes) & set(b_nodes)):
-        na, nb = a_nodes[nid], b_nodes[nid]
-        d = _diff_props(nid, na.kinds[0] if na.kinds else "?", na.properties, nb.properties)
+    b_nodes = {n.id: n for n in baseline.nodes}
+    c_nodes = {n.id: n for n in candidate.nodes}
+    rep.nodes_only_in_baseline = sorted(set(b_nodes) - set(c_nodes))
+    rep.nodes_only_in_candidate = sorted(set(c_nodes) - set(b_nodes))
+    for nid in sorted(set(b_nodes) & set(c_nodes)):
+        nb, nc = b_nodes[nid], c_nodes[nid]
+        d = _diff_props(nid, nb.kinds[0] if nb.kinds else "?", nb.properties, nc.properties)
         if d:
             rep.node_prop_diffs.append(d)
 
     def ekey(e: Edge) -> str:
         return f"{e.start}|{e.kind}|{e.end}"
 
-    a_edges = {ekey(e): e for e in a.edges}
-    b_edges = {ekey(e): e for e in b.edges}
-    rep.edges_only_in_a = sorted(set(a_edges) - set(b_edges))
-    rep.edges_only_in_b = sorted(set(b_edges) - set(a_edges))
-    for k in sorted(set(a_edges) & set(b_edges)):
-        ea, eb = a_edges[k], b_edges[k]
-        d = _diff_props(k, ea.kind, ea.properties, eb.properties)
+    b_edges = {ekey(e): e for e in baseline.edges}
+    c_edges = {ekey(e): e for e in candidate.edges}
+    rep.edges_only_in_baseline = sorted(set(b_edges) - set(c_edges))
+    rep.edges_only_in_candidate = sorted(set(c_edges) - set(b_edges))
+    for k in sorted(set(b_edges) & set(c_edges)):
+        eb, ec = b_edges[k], c_edges[k]
+        d = _diff_props(k, eb.kind, eb.properties, ec.properties)
         if d:
             rep.edge_prop_diffs.append(d)
 
-    rep.node_kind_rollup = _kind_rollup(a.nodes, b.nodes, lambda n: n.kinds)
-    rep.edge_kind_rollup = _kind_rollup(a.edges, b.edges, lambda e: [e.kind])
+    rep.node_kind_rollup = _kind_rollup(baseline.nodes, candidate.nodes, lambda n: n.kinds)
+    rep.edge_kind_rollup = _kind_rollup(baseline.edges, candidate.edges, lambda e: [e.kind])
     return rep

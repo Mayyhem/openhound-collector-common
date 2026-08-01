@@ -42,3 +42,56 @@ def test_run_suite_aggregates_and_runs_invariant(tmp_path):
     assert s.passed == 3 and s.failed == 0
     assert (tmp_path / "r.json").exists()
     assert any("Edge Test Summary" in line for line in captured)
+
+
+# --- con-acdd: distinguish "no such edge" from "edge rejected by property match" ---
+#
+# Both used to report FAIL "not found". They are opposite problems: one means the
+# collector never produced the edge, the other means it produced it and an endpoint
+# or edge property did not match. Conflating them cost real debugging time in the
+# SCCM collector -- three separate tickets were opened to hunt for edges that were
+# being emitted correctly the whole time. Their shared endpoint node was missing a
+# samAccountName, so the matcher rejected otherwise-correct edges and every one of
+# them reported "not found", pointing the investigation at collection instead of at
+# the one property that was actually absent.
+
+def _graph_with_named_endpoint(name="wrong-name"):
+    return Graph(
+        nodes=[Node("A", ["Group", "Base"], {}),
+               Node("B", ["Computer", "Base"], {"samAccountName": name})],
+        edges=[Edge("SCCM_CoerceAndRelayToSMB", "A", "B", {})])
+
+
+def test_edge_absent_still_reports_not_found():
+    """No candidate of that kind at all -- the collector produced nothing."""
+    r = run_edge_case(
+        EdgeCase("e", "SCCM_FullAdministrator", "d", source=NodePattern(kinds=["Group"])),
+        _graph_with_named_endpoint())
+    assert r.outcome == FAIL and r.detail == "not found"
+
+
+def test_edge_rejected_by_property_reports_property_mismatch():
+    """Candidates exist but every one was rejected -- say so, and say how many."""
+    r = run_edge_case(
+        EdgeCase("e", "SCCM_CoerceAndRelayToSMB", "d",
+                 source=NodePattern(kinds=["Group"]),
+                 target=NodePattern(kinds=["Computer"],
+                                    properties={"samAccountName": "sqlsccmsvc"})),
+        _graph_with_named_endpoint())
+    assert r.outcome == FAIL
+    assert "property mismatch" in r.detail, r.detail
+    assert "1 candidate" in r.detail, r.detail
+
+
+def test_node_rejected_by_property_reports_property_mismatch():
+    """Same distinction for node cases."""
+    r = run_node_case(
+        NodeCase("n", "d", ["Computer"], properties={"samAccountName": "sqlsccmsvc"}),
+        _graph_with_named_endpoint())
+    assert r.outcome == FAIL
+    assert "property mismatch" in r.detail, r.detail
+
+
+def test_node_absent_still_reports_not_found():
+    r = run_node_case(NodeCase("n", "d", ["SCCM_AdminUser"]), _graph_with_named_endpoint())
+    assert r.outcome == FAIL and r.detail == "not found"

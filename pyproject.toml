@@ -65,6 +65,14 @@ Homepage = "https://github.com/Mayyhem/openhound-collector-common"
 Repository = "https://github.com/Mayyhem/openhound-collector-common"
 Issues = "https://github.com/Mayyhem/openhound-collector-common/issues"
 
+# The library's first console script. `openhound compare` is not available as a
+# subcommand of the framework binary: openhound/main.py builds its root Typer app
+# inside TyperOverride.__init__, which loads extensions via entry points before the
+# app name is bound -- so an extension cannot add_typer a new verb, and adding one
+# would mean editing framework core. A console script needs neither.
+[project.scripts]
+openhound-compare = "openhound_collector_common.integration_testing.cli:main"
+
 [dependency-groups]
 # This package had no dev group at all until it became its own repo: it was only ever
 # installed into the SCCM collector's venv, which supplied pytest/ruff/mypy. Standing

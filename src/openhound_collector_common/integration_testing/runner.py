@@ -19,16 +19,34 @@ def _count_ok(spec: CountSpec | None, n: int) -> bool:
     return n >= 1 if spec is None else spec.satisfied_by(n)
 
 
+def _no_match_detail(candidates: int) -> str:
+    """Describe a zero-match failure: absent, or present-but-rejected.
+
+    These are opposite problems and used to report identically as "not found".
+    "No edge of this kind exists" points at collection; "N candidates existed and
+    every one was rejected" points at a property on the case or on an endpoint node.
+    Conflating them sent an SCCM investigation hunting for edges that were being
+    emitted correctly all along -- their shared endpoint was simply missing one
+    property, so the matcher rejected them and the report said the data was absent.
+    """
+    if candidates == 0:
+        return "not found"
+    return (f"property mismatch ({candidates} candidate"
+            f"{'s' if candidates != 1 else ''} of this kind, none matched)")
+
+
 def run_edge_case(case: EdgeCase, graph: Graph) -> Result:
     if not case.source and not case.target and not case.properties:
         return Result(case.id, case.kind, case.description, SKIP, "coverage placeholder")
-    matches = [e for e in graph.edges_of_kind(case.kind) if edge_matches(e, graph, case)]
+    candidates = graph.edges_of_kind(case.kind)
+    matches = [e for e in candidates if edge_matches(e, graph, case)]
     n = len(matches)
     if case.negative:
         return (Result(case.id, case.kind, case.description, PASS, "correctly absent") if n == 0
                 else Result(case.id, case.kind, case.description, FAIL, f"incorrectly present ({n})", n))
     if n == 0:
-        return Result(case.id, case.kind, case.description, FAIL, "not found", 0)
+        return Result(case.id, case.kind, case.description, FAIL,
+                      _no_match_detail(len(list(candidates))), 0)
     if not _count_ok(case.count, n):
         return Result(case.id, case.kind, case.description, FAIL, f"wrong count (found {n})", n)
     return Result(case.id, case.kind, case.description, PASS, "", n)
@@ -43,7 +61,12 @@ def run_node_case(case: NodeCase, graph: Graph) -> Result:
         return (Result(case.id, label, case.description, PASS, "correctly absent") if n == 0
                 else Result(case.id, label, case.description, FAIL, f"incorrectly present ({n})", n))
     if n == 0:
-        return Result(case.id, label, case.description, FAIL, "not found", 0)
+        # Same distinction as run_edge_case: nodes of the right KIND existing but
+        # failing the property filter is a different problem from none existing.
+        kind_only = NodePattern(kinds=case.kinds, properties=None)
+        candidates = sum(1 for nd in graph.nodes if node_matches(nd, kind_only))
+        return Result(case.id, label, case.description, FAIL,
+                      _no_match_detail(candidates), 0)
     if not _count_ok(case.count, n):
         return Result(case.id, label, case.description, FAIL, f"wrong count (found {n})", n)
     return Result(case.id, label, case.description, PASS, "", n)
