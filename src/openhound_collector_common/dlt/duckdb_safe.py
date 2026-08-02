@@ -58,6 +58,11 @@ def safe_execute(
     Any non-catalog DuckDB error is logged at ERROR (it indicates a real SQL bug,
     not a not-yet-collected source).
 
+    On a missing source table this logs a one-line summary naming the label and the
+    absent table. When the miss is *unexpected* a companion DEBUG record carries the
+    full DuckDB exception -- its "Did you mean" guess and the SQL echo -- which is
+    worth reading only when the absence is a surprise, e.g. a typo'd table name.
+
     *logger*, if given, is used for all log records instead of this module's logger
     — a consuming collector passes its own so the ``%(name)s`` field stays under its
     namespace (log parity). Defaults to this module's log.
@@ -86,13 +91,18 @@ def safe_execute(
                 # If the classifier itself hits a DB error, stay safe and warn.
                 downgrade = False
         if downgrade:
-            log.debug(
-                "transform %r skipped (expected fallback miss on %r): %s",
-                label, match, err,
-            )
+            # An expected absence needs no diagnosis: the summary already says
+            # everything the exception would, so no companion detail record.
+            log.debug("transform %r skipped: expected missing source table %r", label, match)
         else:
-            # A missing source table is expected before all sources have run.
-            log.warning("transform %r skipped (missing source): %s", label, err)
+            # A missing source table is expected before all sources have run, so this
+            # is a WARNING and not an ERROR. One line: DuckDB's exception carries a
+            # "Did you mean" guess and a re-print of the failing SQL with a caret,
+            # which turned every skipped transform into a five-line block.
+            log.warning("transform %r skipped: source table %r does not exist", label, match)
+            # The guess and the SQL echo only earn their space when the miss is a
+            # SURPRISE -- that is when a typo'd table name is worth diagnosing.
+            log.debug("transform %r: %s", label, err)
     except duckdb.Error as err:
         # Non-catalog error => a real SQL problem worth surfacing loudly.
         log.error("transform %r failed: %s", label, err)
