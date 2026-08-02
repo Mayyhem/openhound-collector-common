@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -34,11 +34,22 @@ _DEFAULT_GRAPH_ZIP_NAME = "opengraph.zip"
 
 @dataclass(frozen=True)
 class StagePaths:
-    """The three paths the preproc + convert stages read/write, derived from OUTPUT_PATH."""
+    """The paths the preproc + convert stages read/write, derived from OUTPUT_PATH.
+
+    The first three are *derived* — pure functions of OUTPUT_PATH, knowable before
+    anything runs. ``graph_zip`` is different: it is an *observation*, populated only
+    by :func:`run_end_to_end` and only when an archive was actually written.
+    """
 
     dataset_dir: Path  # convert input: the dlt dataset dir (OUTPUT_PATH / app.name)
     lookup_db: Path    # preproc output and convert lookup (OUTPUT_PATH / lookup.duckdb)
     graph_out: Path    # convert output dir (OUTPUT_PATH / graph)
+    # The bundled archive run_end_to_end wrote, or None when none was (convert emitted
+    # no *.json, or these paths were merely derived rather than run). Reporting the
+    # archive that exists beats a caller reconstructing where one *should* be: the two
+    # can disagree, and only this one is evidence. Defaulted so the three derived
+    # fields remain the whole constructor for any caller that just wants locations.
+    graph_zip: Optional[Path] = None
 
 
 def derive_stage_paths(app: "OpenHound", output_path: Path) -> StagePaths:
@@ -46,6 +57,10 @@ def derive_stage_paths(app: "OpenHound", output_path: Path) -> StagePaths:
 
     Matches what a collector's manual "next steps" hint prints, so the automated
     and manual workflows read/write the exact same locations.
+
+    ``graph_zip`` is left ``None``: nothing has run yet, so no archive exists to
+    report. This function is also what a collector calls on the *failure* path to
+    print resume commands, where claiming an archive would be actively wrong.
     """
     return StagePaths(
         dataset_dir=output_path / app.name,
@@ -115,7 +130,9 @@ def run_end_to_end(
     silent (dlt NULL_COLLECTOR). Applied per-stage because the framework stages
     consume it differently (see ``_NullProgress``).
     graph_zip_name: basename for the bundled graph archive written into the graph
-    dir after convert; defaults to ``<app.name>_collection.zip``.
+    dir after convert; defaults to ``<app.name>_collection.zip``. The archive that
+    was actually written comes back on the returned ``StagePaths.graph_zip`` (``None``
+    if convert emitted no ``*.json`` and there was nothing to bundle).
     """
     # A hook can be missing if an extension registered collect but not preproc /
     # convert; without both there is nothing to chain, so fail loudly and early
@@ -158,6 +175,10 @@ def run_end_to_end(
     logger.info("Convert complete. Graph written to: %s", paths.graph_out)
     # One upload-ready archive for BloodHound File Ingest; a no-op if convert wrote no json.
     # Collector-agnostic default name; the caller may pass a run-specific one.
-    zip_graph_output(paths.graph_out, graph_zip_name or f"{app.name}_collection.zip")
+    graph_zip = zip_graph_output(paths.graph_out, graph_zip_name or f"{app.name}_collection.zip")
 
-    return paths
+    # Frozen dataclass, so hand back a new one carrying what was actually written.
+    # Without this the archive path was unreportable: the caller knew only the name
+    # it had asked for, and had to rebuild graph_out / name and re-test existence to
+    # say where the upload artifact landed.
+    return replace(paths, graph_zip=graph_zip)

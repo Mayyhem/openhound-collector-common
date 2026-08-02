@@ -189,3 +189,61 @@ def test_run_end_to_end_defaults_zip_name_to_app_collection(tmp_path):
     app = SimpleNamespace(name="sccm", preprocessor=preprocessor, converter=converter)
     paths = run_end_to_end(app, tmp_path, progress=None)
     assert (paths.graph_out / "sccm_collection.zip").exists()  # f"{app.name}_collection.zip"
+
+
+# --- StagePaths.graph_zip: the archive that was written, not the one we expected ---
+# The SCCM collector reports the upload artifact as the last line of its --run-all
+# summary. Before this field it had to rebuild graph_out / <name it had asked for>
+# and re-test existence, because run_end_to_end discarded zip_graph_output's return.
+
+def _app_writing_graph(*filenames):
+    """A fake app whose convert writes *filenames* into the derived graph dir."""
+    def preprocessor(**kwargs):
+        pass
+
+    def converter(**kwargs):
+        out = kwargs["output_path"]
+        out.mkdir(parents=True, exist_ok=True)
+        for name in filenames:
+            (out / name).write_text('{"graph": {"nodes": [], "edges": []}}', encoding="utf-8")
+
+    return SimpleNamespace(name="sccm", preprocessor=preprocessor, converter=converter)
+
+
+def test_run_end_to_end_reports_the_archive_it_wrote(tmp_path):
+    paths = run_end_to_end(
+        _app_writing_graph("sccm_nodes-1.json"), tmp_path, progress=None, graph_zip_name=_NAME,
+    )
+    assert paths.graph_zip == paths.graph_out / _NAME
+    assert paths.graph_zip.exists()  # the reported path is evidence, not a guess
+
+
+def test_run_end_to_end_reports_the_default_named_archive(tmp_path):
+    paths = run_end_to_end(_app_writing_graph("sccm_nodes-1.json"), tmp_path, progress=None)
+    assert paths.graph_zip == paths.graph_out / "sccm_collection.zip"
+
+
+def test_graph_zip_is_none_when_convert_emitted_no_json(tmp_path):
+    """Nothing to bundle is a no-op, so there is no archive to report -- and a caller
+    that reconstructs the path instead would print one that does not exist."""
+    paths = run_end_to_end(_app_writing_graph(), tmp_path, progress=None, graph_zip_name=_NAME)
+    assert paths.graph_zip is None
+    assert not (paths.graph_out / _NAME).exists()
+
+
+def test_derived_paths_report_no_archive():
+    """derive_stage_paths runs before anything is written -- including on the failure
+    path, where claiming an archive exists would be actively misleading."""
+    app, _ = _fake_app(name="sccm")
+    assert derive_stage_paths(app, Path("/data/out")).graph_zip is None
+
+
+def test_the_three_derived_paths_remain_the_whole_constructor():
+    """graph_zip defaults, so existing callers that build a StagePaths from the three
+    derived locations keep working and compare equal to a freshly derived one."""
+    app, _ = _fake_app(name="sccm")
+    assert StagePaths(
+        dataset_dir=Path("/data/out/sccm"),
+        lookup_db=Path("/data/out/lookup.duckdb"),
+        graph_out=Path("/data/out/graph"),
+    ) == derive_stage_paths(app, Path("/data/out"))
