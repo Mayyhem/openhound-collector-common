@@ -47,10 +47,24 @@ from __future__ import annotations
 
 import socket
 import ssl
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from impacket import ntlm, tds
+# impacket 0.13.1's mssql/version.py:182 returns from inside a finally block, which
+# Python 3.14 reports as a SyntaxWarning the first time the module is compiled.
+# impacket.tds imports it (tds.py:54), so without this guard the warning lands on the
+# operator's console -- noise about a third-party file they cannot act on.
+#
+# Scoped rather than a global filterwarnings(): a return-in-finally in OUR code must
+# still be reported. Note module= does NOT work here -- for a compile-time warning
+# CPython calls warn_explicit() with module=None, and warnings.py then derives the
+# module from the FILE PATH rather than the dotted name, so `module=r"impacket\..*"`
+# never matches. This runs at import, single-threaded, so catch_warnings' documented
+# thread-unsafety does not apply.
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", SyntaxWarning)
+    from impacket import ntlm, tds
 
 from . import auth as auth_mod
 from ..logging.log_context import get_logger

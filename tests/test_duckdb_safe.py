@@ -141,13 +141,65 @@ def test_catalog_error_that_is_not_a_missing_table_is_loud(con, caplog):
     with caplog.at_level(logging.DEBUG):
         safe_execute(con, "bad-function", "SELECT list_filtr([1], x -> x > 0)")
     text = caplog.text
-    assert "skipped (missing source)" not in text, text
+    assert "skipped" not in text, text
     assert "bad-function" in text and "failed" in text, text
 
 
 def test_missing_source_table_is_still_quiet(con, caplog):
-    """The intended quiet path is unchanged."""
+    """The intended quiet path is unchanged: logged and swallowed, never raised."""
     import logging
     with caplog.at_level(logging.DEBUG):
         safe_execute(con, "absent-source", "SELECT * FROM s.never_collected")
-    assert "skipped (missing source)" in caplog.text, caplog.text
+    assert "absent-source" in caplog.text, caplog.text
+    assert "never_collected" in caplog.text, caplog.text
+
+
+# --- message shape: one scannable line, detail only when the miss is a surprise ---
+#
+# DuckDB's CatalogException carries a 'Did you mean "x"?' guess and a re-print of the
+# failing SQL with a caret, so logging the whole exception made every skipped transform
+# a five-line block -- ~535 lines in one low-privilege SCCM run, all of them expected.
+
+def test_unexpected_miss_is_one_warning_line_plus_a_debug_with_the_detail(con, caplog):
+    """The WARNING is scannable; the guess and the SQL echo move to a companion DEBUG."""
+    import logging
+    with caplog.at_level(logging.DEBUG):
+        safe_execute(con, "node_x<-absent_y", "SELECT * FROM s.absent_y")
+
+    warnings_ = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings_) == 1, [r.getMessage() for r in warnings_]
+    summary = warnings_[0].getMessage()
+    assert "node_x<-absent_y" in summary
+    assert "absent_y" in summary
+    assert "\n" not in summary, f"the WARNING must be one line, got:\n{summary}"
+    assert "Did you mean" not in summary, summary
+
+    debugs = [r for r in caplog.records
+              if r.levelno == logging.DEBUG and "node_x<-absent_y" in r.getMessage()]
+    assert debugs, "expected a companion DEBUG carrying the full DuckDB text"
+    assert any("Catalog Error" in r.getMessage() for r in debugs), \
+        [r.getMessage() for r in debugs]
+
+
+def test_expected_miss_is_one_debug_line_with_no_companion_detail(con, caplog):
+    """An expected absence needs no diagnosis, so it does not get the noisy detail."""
+    import logging
+    with caplog.at_level(logging.DEBUG):
+        safe_execute(con, "node_x<-absent_y", "SELECT * FROM s.absent_y",
+                     expected_miss=lambda _con, _missing: True)
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    relevant = [r for r in caplog.records if "node_x<-absent_y" in r.getMessage()]
+    assert len(relevant) == 1, [r.getMessage() for r in relevant]
+    assert relevant[0].levelno == logging.DEBUG
+    assert "Catalog Error" not in relevant[0].getMessage(), relevant[0].getMessage()
+
+
+def test_summary_names_the_table_even_when_the_label_does_not(con, caplog):
+    """The label is free-form, so the missing table must be named independently."""
+    import logging
+    with caplog.at_level(logging.DEBUG):
+        safe_execute(con, "some-opaque-label", "SELECT * FROM s.absent_y")
+    warnings_ = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings_) == 1
+    assert "absent_y" in warnings_[0].getMessage()
