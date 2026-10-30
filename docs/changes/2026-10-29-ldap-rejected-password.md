@@ -1,5 +1,13 @@
 # Stop after a known rejected-password reply, regardless of label spacing
 
+**Update, October 30, 2026.** A lab run showed this rule never fired for SCCM.
+The one-step automatic bind dropped the `data 52e` reason code, so a reply
+like the one below matched no known code. Every password bind now keeps the
+reason code, and typed-in details rejected with no reason code at all also
+stop. The test below that expected a bare "Invalid Credentials" to retry no
+longer includes that case. See
+[stop the whole run after one rejected sign-in](2026-10-30-one-rejected-sign-in-per-run.md).
+
 The owner approved the [plain-English proposal](2026-10-29-ldap-bad-password-proposal.md)
 on October 29, 2026. The original offline proof showed two submissions after the
 exact Go example `LDAP Result Code 49 "Invalid Credentials": data 52e`.

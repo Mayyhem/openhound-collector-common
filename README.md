@@ -32,6 +32,7 @@ and hash logins passed in both consumer environments; full acceptance remains pe
 | `clients/wmi_session.py` | Exclusive same-host explicit WMI sessions through complete result and connection cleanup. |
 | `clients/windows_ldap.py` | Optional current-user Windows LDAP fallback, paged native reads, copied raw attributes and owned-handle cleanup. |
 | `clients/identity_errors.py` | Definite Windows account-rejection detection, including wrapped SSPI status and WMI automation errors. |
+| `clients/credential_guard.py` | One run's shared record that its sign-in details were rejected. Clients check it before signing in and report definite rejections; the first report stops the run. |
 | `clients/kerberos.py` | Run-local identity selection from base64 KRB-CRED, MIT cache v3/v4 or keytab v2; exact service/port matching and one guarded keytab TGT acquisition. |
 | `clients/ldap_kerberos.py` | Explicit Kerberos bind on a normal ldap3 connection; certificate channel binding over TLS and impacket sealing for plain LDAP. |
 | `discovery/dns.py` | DC/SRV/A discovery + DNS resolver override (proxy-aware). |
@@ -250,6 +251,30 @@ stops the login attempts; later calls on that same client do not submit it again
 Other connection failures retain their existing retry choices. This applies with
 and without optional read budgets. See the approved
 [rejected-password fix](docs/changes/2026-10-29-ldap-rejected-password.md).
+
+Every password bind now runs step by step, so a rejection keeps the domain
+controller's reason code. Typed-in details rejected with no reason code at all
+also stop. To stop a whole run after one rejection, create one
+`CredentialGuard` per run and pass it to every `AdClient` and `WmiClient`.
+Call `AdClient.confirm_credentials()` once before visiting any computer, and
+register a stop action, such as stopping the work queue, with
+`add_stop_action`. See
+[stop the whole run after one rejected sign-in](docs/changes/2026-10-30-one-rejected-sign-in-per-run.md).
+
+```python
+from openhound_collector_common.clients.ad import AdClient, LdapAuth
+from openhound_collector_common.clients.credential_guard import (
+    CREDENTIALS_REJECTED_REASON, CredentialCheck, CredentialGuard,
+)
+
+guard = CredentialGuard()
+guard.add_stop_action(lambda: work_queue.stop(CREDENTIALS_REJECTED_REASON))
+directory = AdClient("mayyhem.com", dc="dc.mayyhem.com",
+                     auth=LdapAuth(username="MAYYHEM\\lowpriv", password="password"),
+                     credential_guard=guard)
+if directory.confirm_credentials() is CredentialCheck.REJECTED:
+    raise SystemExit(1)  # One failed sign-in, and nothing else was tried.
+```
 
 The [additional reference contracts](docs/changes/2026-10-29-reference-logging-and-native-values.md)
 check logger fan-out and exact Windows domain/SID examples through existing

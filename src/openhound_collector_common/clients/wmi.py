@@ -66,6 +66,7 @@ from .operations import (
     cancel_windows_call,
 )
 from .wmi_session import WmiHostLease
+from .credential_guard import CredentialGuard, is_rejected_sign_in
 from .identity_errors import is_windows_credential_rejection
 from ..collection import OperationResult
 from ..discovery.network import active_network_settings
@@ -623,9 +624,13 @@ class WmiClient:
         *,
         read_control: ReadControl | None = None,
         on_query: Callable[[OperationResult], None] | None = None,
+        credential_guard: CredentialGuard | None = None,
     ) -> None:
         self._target = target
         self._auth = auth or WmiAuth()
+        # Shared by every client in one run: refuse to sign in after any client
+        # saw a rejection, and report this client's definite rejections there.
+        self._credential_guard = credential_guard
         self._backend: Any = None  # the connected backend, cached after connect()
         self._read_control = read_control
         self._operation: ReadOperation | None = None
@@ -784,6 +789,11 @@ class WmiClient:
                 "WMI credentials were already rejected; refusing another submission"
             )
             raise self._credential_failure
+        if self._credential_guard is not None:
+            # Another client in this run may already have seen a rejection.
+            self._credential_guard.check_before_sign_in(
+                f"a WMI sign-in on {self._target}"
+            )
         if self._backend is not None:
             self._backend.operation = self._operation
             self._backend.connect()
@@ -870,6 +880,10 @@ class WmiClient:
             self._credential_failure = RuntimeError(
                 "WMI credentials were already rejected"
             )
+            if self._credential_guard is not None and is_rejected_sign_in(error):
+                # A malformed ticket stops only this client; a refused password
+                # or account stops every sign-in in the run.
+                self._credential_guard.record_rejection(f"WMI on {self._target}")
         # Ordinary access, class or query errors do not establish a rejected identity.
 
     def query(self, wql: str, namespace: str = DEFAULT_NAMESPACE) -> list[dict]:

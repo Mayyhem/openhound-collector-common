@@ -47,8 +47,29 @@ class CredentialInputError(ValueError):
     """An explicit credential source is malformed, ambiguous, or mismatched."""
 
 
+# Kerberos reply codes that prove the account or its password was refused
+# (RFC 4120 section 7.5.9): 6 means the account does not exist, 18 means it is
+# disabled, locked or expired, 23 means its password expired, and 24 means the
+# password was wrong. Other codes, such as an unreachable domain controller or
+# a clock difference, say nothing about the password.
+_REJECTED_IDENTITY_CODES = frozenset({6, 18, 23, 24})
+
+
 class KerberosAcquisitionError(RuntimeError):
-    """The selected identity could not obtain a ticket; do not retry its secret."""
+    """The selected identity could not obtain a ticket; do not retry its secret.
+
+    ``kdc_error_code`` keeps the domain controller's numeric reason, when it
+    sent one, so a caller can tell a refused password from a network problem.
+    """
+
+    def __init__(self, message: str, *, kdc_error_code: int | None = None) -> None:
+        super().__init__(message)
+        self.kdc_error_code = kdc_error_code
+
+    @property
+    def is_rejected_identity(self) -> bool:
+        """True only when the domain controller refused the account or password."""
+        return self.kdc_error_code in _REJECTED_IDENTITY_CODES
 
 
 def acquisition_failure(error: Exception) -> KerberosAcquisitionError:
@@ -63,7 +84,8 @@ def acquisition_failure(error: Exception) -> KerberosAcquisitionError:
     detail = f" (KDC error {code})" if isinstance(code, int) else ""
     logger.error("Kerberos ticket acquisition failed%s", detail)
     return KerberosAcquisitionError(
-        f"Could not obtain a Kerberos ticket for the selected identity{detail}"
+        f"Could not obtain a Kerberos ticket for the selected identity{detail}",
+        kdc_error_code=code if isinstance(code, int) else None,
     )
 
 
@@ -163,6 +185,9 @@ class KerberosCredentials:
     _nt_hash: bytes = field(default=b"", repr=False)
     _tgt: TicketMaterial | None = field(default=None, init=False, repr=False)
     _tgt_failed: bool = field(default=False, init=False, repr=False)
+    # The domain controller's reason for the cached failure, repeated on reuse
+    # so a later caller can still tell a refused password from a network problem.
+    _tgt_failure_code: int | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -235,7 +260,8 @@ class KerberosCredentials:
                     "Reusing the selected identity's previous acquisition failure"
                 )
                 raise KerberosAcquisitionError(
-                    "Kerberos ticket acquisition already failed for this identity"
+                    "Kerberos ticket acquisition already failed for this identity",
+                    kdc_error_code=self._tgt_failure_code,
                 )
             if self._tgt is None:
                 try:
@@ -255,7 +281,9 @@ class KerberosCredentials:
                     self._tgt = {"KDC_REP": reply, "cipher": cipher, "sessionKey": key}
                 except Exception as error:
                     self._tgt_failed = True
-                    raise acquisition_failure(error) from None
+                    failure = acquisition_failure(error)
+                    self._tgt_failure_code = failure.kdc_error_code
+                    raise failure from None
             # An existing TGT belongs to this object and never comes from the environment.
             return self._tgt
 

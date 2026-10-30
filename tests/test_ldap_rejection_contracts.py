@@ -134,7 +134,9 @@ def test_known_rejected_accounts_stop_for_both_client_timeout_policies(
         "strongerAuthRequired",
         "Invalid Credentials: data 80090346",
         "Invalid Credentials: data 1234",
-        "Invalid Credentials",
+        # A bare "Invalid Credentials" with no reason used to retry here. Since
+        # October 30, 2026 a typed-in identity stops on it instead; see
+        # test_credential_guard.py. The lab showed that reply was a wrong password.
         "an unrelated message containing data 52e",
     ],
 )

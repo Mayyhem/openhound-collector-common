@@ -166,6 +166,27 @@ def test_failed_keytab_is_submitted_once_across_concurrent_consumers(
         WmiAuth(kerberos_credentials=selected).kerberos_credentials.service_ticket("HOST/sql.example.com")
 
 
+def test_reused_keytab_failure_still_says_the_password_was_refused(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "keys"
+    path.write_bytes(keytab_bytes(("first@EXAMPLE.COM", 18, 1, b"a" * 32)))
+    selected = load_kerberos_credentials(keytab_file=path)
+
+    class KdcReply(Exception):
+        def getErrorCode(self):
+            return 24  # KDC_ERR_PREAUTH_FAILED: the key or password was wrong
+
+    def refuse(*args):
+        raise KdcReply("raw provider response must not escape")
+
+    monkeypatch.setattr(kerberos, "getKerberosTGT", refuse)
+    for _ in range(2):  # The second call reuses the cached failure.
+        with pytest.raises(KerberosAcquisitionError) as caught:
+            selected.service_ticket("HOST/sql.example.com")
+        assert caught.value.is_rejected_identity
+
+
 def test_wmi_retains_validated_credentials_even_if_cache_file_is_replaced(tmp_path):
     path = tmp_path / "cache"
     path.write_bytes(cache_bytes("HOST/sql.example.com@EXAMPLE.COM"))

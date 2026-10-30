@@ -46,6 +46,20 @@ protocol-level rejections (``strongerAuthRequired``, CBT mismatch
 ``80090346``, TLS / connect failures) are returned *before* the password is
 validated, so retrying another transport profile after one of those does not
 advance ``badPwdCount``.
+
+Every password bind opens, upgrades and binds the connection step by step, so
+a rejection keeps the domain controller's detailed reason (``data 52e``). The
+library's one-step automatic bind drops that detail. Its bare
+``invalidCredentials`` message then never matched the sub-code rule, and the
+waterfall retried another profile. In the lab each directory search therefore
+cost two failed sign-ins. A typed-in identity whose rejection still carries no
+reason at all is treated as rejected too, because guessing wrong would cost
+another failed sign-in.
+
+An optional run-wide :class:`~.credential_guard.CredentialGuard` lets one
+rejection here stop every other sign-in in the same run, and
+:meth:`AdClient.confirm_credentials` signs in once before any computer is
+visited.
 """
 
 from __future__ import annotations
@@ -65,9 +79,7 @@ from typing import Any, Iterable, Literal, Optional
 
 from ldap3 import (
     ALL,
-    AUTO_BIND_NO_TLS,
     AUTO_BIND_NONE,
-    AUTO_BIND_TLS_BEFORE_BIND,
     KERBEROS,
     NTLM,
     SASL,
@@ -88,6 +100,12 @@ from ..discovery.dns import dc_hostname_for_address
 from ..discovery.network import active_resolver
 from .auth import split_user_domain
 from .operations import ClientCleanupError, ReadControl, ReadOperation, ReadStoppedError
+from .credential_guard import (
+    CredentialCheck,
+    CredentialGuard,
+    CredentialsRejectedError,
+    is_rejected_sign_in,
+)
 from .identity_errors import is_windows_credential_rejection
 from .windows_ldap import WindowsLdapClient, WindowsLdapError
 from ..proxy import active_proxy
@@ -182,6 +200,19 @@ def _is_credential_failure(exc: BaseException) -> bool:
         # itself neither opens a connection nor hides a failed operation.
         return False
     return any(f"data {code}" in text for code in _CREDENTIAL_FAILURE_SUBCODES)
+
+
+def _is_uncoded_rejection(exc: BaseException) -> bool:
+    """True for an invalidCredentials reply that carries no ``data`` reason code.
+
+    The ldap3 automatic bind reported only "automatic bind not successful -
+    invalidCredentials". Without a reason the reply could be a wrong password,
+    so a typed-in identity must not try another profile. A reply that names a
+    different reason, such as the channel-binding code 80090346, is not this.
+    """
+    text = _bind_error_text(exc)
+    compact_text = "".join(text.split())
+    return "invalidcredentials" in compact_text and "data " not in text
 
 
 def _is_ip_address(value: Optional[str]) -> bool:
@@ -421,12 +452,17 @@ class AdClient:
         on_query: Callable[[OperationResult], None] | None = None,
         native_fallback: ReadControl | None = None,
         read_control: ReadControl | None = None,
+        credential_guard: CredentialGuard | None = None,
     ) -> None:
         self.domain = domain
         self.dc = dc
         self.auth = auth or LdapAuth()
         self.port = port
         self.on_query = on_query
+        # Shared by every client in one run. When given, this client refuses to
+        # sign in after any client in the run saw a rejection, and reports its
+        # own definite rejections there so the whole run stops.
+        self.credential_guard = credential_guard
         self.last_query_result: OperationResult | None = None
         self.native_fallback = native_fallback
         self.read_control = read_control
@@ -477,6 +513,69 @@ class AdClient:
         finally:
             self._bind_operation = None
 
+    def has_supplied_credentials(self) -> bool:
+        """True when a password, hash or Kerberos ticket or key was supplied.
+
+        False means the logged-on Windows session (or an anonymous bind) is
+        used, so no typed-in password can be wrong.
+        """
+        return self._has_explicit_ntlm() or self._has_nt_hash() or self._has_ticket()
+
+    def confirm_credentials(self) -> CredentialCheck:
+        """Sign in once before any computer is visited.
+
+        With a wrong password this costs exactly one failed sign-in, and the
+        caller stops the run before anything else uses the same details. A
+        successful sign-in stays open and the first search reuses it.
+        """
+        if not self.has_supplied_credentials():
+            logger.debug(
+                "No sign-in details were supplied; the Windows session is used, "
+                "so there is nothing to check first"
+            )
+            return CredentialCheck.NOT_NEEDED
+        logger.info("Checking the supplied sign-in details with one directory sign-in")
+        try:
+            self.bind()
+        except (ClientCleanupError, ReadStoppedError):
+            logger.error("The sign-in check was stopped or could not clean up")
+            raise
+        except Exception as error:
+            if self._credential_failure is not None or isinstance(
+                error, CredentialsRejectedError
+            ):
+                logger.error(
+                    "The sign-in details were rejected before any computer was visited"
+                )
+                return CredentialCheck.REJECTED
+            logger.warning(
+                "The sign-in details could not be checked before collection (%s); "
+                "collection continues, and the first definite rejection will stop it",
+                type(error).__name__,
+            )
+            return CredentialCheck.UNCHECKED
+        logger.info("The domain controller accepted the supplied sign-in details")
+        return CredentialCheck.ACCEPTED
+
+    def _remember_rejection(
+        self, error: Exception, *, is_definite: bool, rejected_by: str
+    ) -> None:
+        """Never submit this identity again, and stop the run when it is definite.
+
+        "Definite" means the reply proves the password or account was refused.
+        A malformed ticket file, for example, stops this client but says nothing
+        about the password, so other sign-ins in the run may continue.
+        """
+        self._credential_failure = error
+        if self.credential_guard is None:
+            return  # No run-wide record was supplied; only this client stops.
+        if is_definite:
+            self.credential_guard.record_rejection(rejected_by)
+        else:
+            logger.debug(
+                "This directory sign-in problem does not prove the password was wrong"
+            )
+
     def _bind(self) -> Connection:
         if self._credential_failure is not None:
             logger.warning(
@@ -485,6 +584,9 @@ class AdClient:
             raise self._credential_failure
         if self._conn is not None and self._conn.bound:
             return self._conn
+        if self.credential_guard is not None:
+            # Another client in this run may already have seen a rejection.
+            self.credential_guard.check_before_sign_in("a directory sign-in")
 
         attempts = self._build_attempt_plan()
         attempts, host = self._prepare_attempts_and_host(attempts)
@@ -508,19 +610,31 @@ class AdClient:
                 )
                 raise
             except (CredentialInputError, KerberosAcquisitionError) as error:
-                self._credential_failure = error
                 logger.error(
                     "LDAP cannot use the selected explicit Kerberos identity; stopping attempts"
                 )
+                self._remember_rejection(
+                    error,
+                    is_definite=is_rejected_sign_in(error),
+                    rejected_by=f"The domain controller {host}",
+                )
                 raise
             except LDAPException as exc:
-                if _is_credential_failure(exc) or is_windows_credential_rejection(exc):
-                    self._credential_failure = exc
+                if (
+                    _is_credential_failure(exc)
+                    or is_windows_credential_rejection(exc)
+                    or (self.has_supplied_credentials() and _is_uncoded_rejection(exc))
+                ):
                     # Bad/locked/expired credential — stop now to avoid lockout.
                     logger.error(
                         "LDAP bind via %s failed with a credential error: %s",
                         attempt.label,
                         exc,
+                    )
+                    self._remember_rejection(
+                        exc,
+                        is_definite=True,
+                        rejected_by=f"The domain controller {host}",
                     )
                     raise
                 last_exc = exc
@@ -543,9 +657,13 @@ class AdClient:
                 continue
             except Exception as exc:
                 if is_windows_credential_rejection(exc):
-                    self._credential_failure = exc
                     logger.error(
                         "Windows rejected the LDAP identity; stopping authentication attempts"
+                    )
+                    self._remember_rejection(
+                        exc,
+                        is_definite=True,
+                        rejected_by=f"The domain controller {host}",
                     )
                     raise
                 if attempt.auth_mode in ("kerberos", "sspi_ntlm"):
@@ -864,9 +982,12 @@ class AdClient:
         )
 
         kwargs: dict[str, Any] = {
-            "auto_bind": AUTO_BIND_TLS_BEFORE_BIND
-            if attempt.start_tls
-            else AUTO_BIND_NO_TLS,
+            # Open, upgrade and bind step by step below rather than with ldap3's
+            # one-step automatic bind. The automatic bind reports a rejection as
+            # "automatic bind not successful - invalidCredentials" and drops the
+            # domain controller's reason (data 52e), which the stop rule needs.
+            # The step-by-step order also lets cancellation reach the socket.
+            "auto_bind": AUTO_BIND_NONE,
             "read_only": True,
             "receive_timeout": 30,
             # Never chase referrals: a subtree search at the domain root makes AD
@@ -904,23 +1025,9 @@ class AdClient:
             kwargs["channel_binding"] = TLS_CHANNEL_BINDING
 
         try:
-            if self.read_control is None:
-                return Connection(server, **kwargs)
-            # Construct without network work so cancellation can reach the
-            # socket during open, TLS, authentication and schema reads. ldap3's
-            # documented manual open/start_tls/bind sequence preserves policy.
-            kwargs["auto_bind"] = AUTO_BIND_NONE
+            # Construction does no network work, so cancellation can reach the
+            # socket during open, TLS, authentication and schema reads.
             connection = Connection(server, **kwargs)
-            self._opening_conn = connection
-            connection.open(read_server_info=False)
-            if attempt.start_tls and not connection.start_tls(read_server_info=False):
-                logger.warning("StartTLS before monitored LDAP bind failed")
-                raise LDAPBindError("StartTLS before monitored LDAP bind failed")
-            if not connection.bind():
-                logger.warning("Monitored LDAP bind was rejected")
-                raise LDAPBindError(str(connection.result))
-            connection.refresh_server_info()
-            return connection
         except TypeError as exc:
             # Older ldap3 rejects session_security / channel_binding kwargs.
             if attempt.session_security or attempt.channel_binding:
@@ -928,6 +1035,32 @@ class AdClient:
                     "LDAP signing / channel binding requires ldap3 >= 2.10.2rc4 "
                     "(session_security and channel_binding support)."
                 ) from exc
+            raise
+        if self.read_control is not None:
+            self._opening_conn = connection
+        try:
+            connection.open(read_server_info=False)
+            if attempt.start_tls and not connection.start_tls(read_server_info=False):
+                logger.warning("StartTLS before the LDAP bind failed")
+                raise LDAPBindError("StartTLS before the LDAP bind failed")
+            # The schema and server details are read once, just below.
+            if not connection.bind(read_server_info=False):
+                logger.warning("The LDAP bind was rejected")
+                # The result includes the domain controller's reason, such as
+                # "data 52e", which decides whether another profile is safe.
+                raise LDAPBindError(str(connection.result))
+            connection.refresh_server_info()
+            return connection
+        except BaseException:
+            if self.read_control is not None:
+                raise  # _open_attempt owns monitored failed-bind cleanup.
+            try:
+                connection.unbind()
+            except Exception as error:
+                logger.debug(
+                    "Failed LDAP bind connection cleanup failed (%s)",
+                    type(error).__name__,
+                )
             raise
 
     def _open_explicit_kerberos_connection(
@@ -1234,7 +1367,11 @@ class AdClient:
                 logger.warning(
                     "Windows LDAP rejected the current identity; no further submissions will be made"
                 )
-                self._credential_failure = error
+                self._remember_rejection(
+                    error,
+                    is_definite=True,
+                    rejected_by=f"The domain controller {self.dc or self.domain}",
+                )
             raise
 
     def paged_search(
