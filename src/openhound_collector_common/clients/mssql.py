@@ -43,13 +43,26 @@ channel binding, pass-the-hash, pass-the-ticket, current-user SSPI).
 All TLS paths are forced to TLS 1.2 max so the EPA ``tls-unique`` channel binding
 remains available.
 """
+
 from __future__ import annotations
 
 import socket
 import ssl
 import warnings
-from dataclasses import dataclass
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass, field
 from typing import Callable, Optional
+from .kerberos import (
+    CredentialInputError,
+    KerberosAcquisitionError,
+    KerberosCredentials,
+    load_kerberos_credentials,
+    validate_kerberos_identity,
+    validate_secret_sources,
+)
+from ..logging.authentication import authentication_diagnostics
+from .deadline import Deadline
+from .operations import ClientCleanupError, ReadControl, ReadOperation, ReadStoppedError
 
 # impacket 0.13.1's mssql/version.py:182 returns from inside a finally block, which
 # Python 3.14 reports as a SyntaxWarning the first time the module is compiled.
@@ -72,10 +85,10 @@ from ..logging.log_context import get_logger
 logger = get_logger(__name__)
 
 # MS-TDS PRELOGIN encryption byte values (mirror impacket.tds.TDS_ENCRYPT_*).
-ENCRYPT_OFF = tds.TDS_ENCRYPT_OFF        # 0
-ENCRYPT_ON = tds.TDS_ENCRYPT_ON          # 1
+ENCRYPT_OFF = tds.TDS_ENCRYPT_OFF  # 0
+ENCRYPT_ON = tds.TDS_ENCRYPT_ON  # 1
 ENCRYPT_NOT_SUP = tds.TDS_ENCRYPT_NOT_SUP  # 2
-ENCRYPT_REQ = tds.TDS_ENCRYPT_REQ        # 3
+ENCRYPT_REQ = tds.TDS_ENCRYPT_REQ  # 3
 ENCRYPT_STRICT = tds.TDS_ENCRYPT_STRICT  # 8
 
 DEFAULT_PORT = 1433
@@ -130,19 +143,63 @@ class Auth:
     """
 
     username: Optional[str] = None
-    password: Optional[str] = None
-    nt_hash: Optional[str] = None          # pass-the-hash (bare NT or LM:NT)
-    kerberos_ticket: Optional[str] = None  # pass-the-ticket: base64 KRB-CRED
-    use_sspi: bool = False                 # current-user SSPI (Windows)
+    password: Optional[str] = field(default=None, repr=False)
+    nt_hash: Optional[str] = field(default=None, repr=False)
+    kerberos_ticket: Optional[str] = field(default=None, repr=False)
+    kerberos_ccache: str | None = field(default=None, repr=False)
+    kerberos_keytab: str | None = field(default=None, repr=False)
+    kerberos_realm: str | None = None
+    kerberos_credentials: KerberosCredentials | None = field(default=None, repr=False)
+    use_sspi: bool = False  # current-user SSPI (Windows)
     domain: str = ""
-    spn: Optional[str] = None              # explicit SPN override
-    kdc_host: Optional[str] = None         # KDC for fetching a service ticket
+    spn: Optional[str] = None  # explicit SPN override
+    kdc_host: Optional[str] = None  # KDC for fetching a service ticket
+
+    def __post_init__(self) -> None:
+        validate_secret_sources(
+            password=self.password,
+            nt_hash=self.nt_hash,
+            ticket=self.kerberos_ticket,
+            ccache=self.kerberos_ccache,
+            keytab=self.kerberos_keytab,
+            loaded_credentials=self.kerberos_credentials,
+        )
+        if self.kerberos_credentials is not None:
+            validate_kerberos_identity(
+                self.kerberos_credentials, self.username, self.kerberos_realm
+            )
+        if self.use_sspi and (
+            self.password is not None
+            or self.nt_hash is not None
+            or self.uses_kerberos()
+        ):
+            logger.error(
+                "Current-user SQL authentication cannot also select explicit credentials"
+            )
+            raise CredentialInputError(
+                "Choose current-user authentication or explicit credentials"
+            )
+
+    def uses_kerberos(self) -> bool:
+        """Whether the caller selected an explicit Kerberos source or realm."""
+        return any(
+            value is not None
+            for value in (
+                self.kerberos_ticket,
+                self.kerberos_ccache,
+                self.kerberos_keytab,
+                self.kerberos_credentials,
+                self.kerberos_realm,
+            )
+        )
 
     def is_windows_auth(self) -> bool:
         """True when this is Windows auth (domain NTLM, PtH, PtT, or SSPI)."""
         # A non-empty domain, an NT hash, a Kerberos ticket, or SSPI all imply
         # integrated/Windows auth; bare username+password is a SQL login.
-        return bool(self.domain or self.nt_hash or self.kerberos_ticket or self.use_sspi)
+        return bool(
+            self.domain or self.nt_hash or self.uses_kerberos() or self.use_sspi
+        )
 
     def is_sql_login(self) -> bool:
         """True for a plain SQL login (username+password, no Windows auth)."""
@@ -171,7 +228,7 @@ def parse_target(target: str) -> Target:
     spec = target.strip()
     if spec.upper().startswith("MSSQLSVC/"):
         # SPN form MSSQLSvc/host:port — drop the service-class prefix.
-        spec = spec[len("MSSQLSVC/"):]
+        spec = spec[len("MSSQLSVC/") :]
     if "\\" in spec:
         # host\instance (optionally with :port on the instance).
         host, rest = spec.split("\\", 1)
@@ -192,7 +249,9 @@ def _to_port(text: str) -> int:
     try:
         return int(text)
     except ValueError:
-        logger.warning("Invalid port %r in target; using default %d", text, DEFAULT_PORT)
+        logger.warning(
+            "Invalid port %r in target; using default %d", text, DEFAULT_PORT
+        )
         return DEFAULT_PORT
 
 
@@ -285,8 +344,10 @@ class _Tds(tds.MSSQL):
         self.out_bio = out_bio
         # tls-unique is the EPA channel-binding token; capture it now.
         self.tls_unique = tls.get_channel_binding("tls-unique")
-        logger.debug("TDS 7.x TLS established (tls_unique=%s)",
-                     "present" if self.tls_unique else "absent")
+        logger.debug(
+            "TDS 7.x TLS established (tls_unique=%s)",
+            "present" if self.tls_unique else "absent",
+        )
 
     def parseRow(self, token, tuplemode=False):
         """Decode one result row, fixing impacket's ``tinyint``/``bit`` handling.
@@ -434,12 +495,18 @@ class _Tds(tds.MSSQL):
                     data = data[struct.calcsize("<H") :]
                     baseDate = datetime.date(1900, 1, 1)
                 if value != "NULL":
-                    dateValue = datetime.date.fromordinal(baseDate.toordinal() + dateValue)
+                    dateValue = datetime.date.fromordinal(
+                        baseDate.toordinal() + dateValue
+                    )
                     hours, mod = divmod(timeValue // 300, 60 * 60)
                     minutes, second = divmod(mod, 60)
                     value = datetime.datetime(
-                        dateValue.year, dateValue.month, dateValue.day,
-                        hours, minutes, second,
+                        dateValue.year,
+                        dateValue.month,
+                        dateValue.day,
+                        hours,
+                        minutes,
+                        second,
                     )
             elif _type == tds.TDS_INT4TYPE:
                 value = struct.unpack("<l", data[:4])[0]
@@ -471,7 +538,9 @@ class _Tds(tds.MSSQL):
                     fmt = "<q"
                 data = data[1:]
                 if valueSize > 0:
-                    raw = struct.unpack("<q" if valueSize == 8 else "<l", data[:valueSize])[0]
+                    raw = struct.unpack(
+                        "<q" if valueSize == 8 else "<l", data[:valueSize]
+                    )[0]
                     value = Decimal(raw) / Decimal(10000)
                     data = data[valueSize:]
                 else:
@@ -621,8 +690,11 @@ class _Tds(tds.MSSQL):
         self.epa_encryption_flag = ENCRYPT_STRICT if self.tds8 else resp["Encryption"]
 
         version = ntlm.VERSION()
-        (version["ProductMajorVersion"], version["ProductMinorVersion"],
-         version["ProductBuild"]) = (10, 0, 20348)
+        (
+            version["ProductMajorVersion"],
+            version["ProductMinorVersion"],
+            version["ProductBuild"],
+        ) = (10, 0, 20348)
 
         type1 = auth_mod.ntlm_type1(version=version)
         login = self._build_login7(database, sspi=type1.getData())
@@ -642,26 +714,21 @@ class _Tds(tds.MSSQL):
             # No live TLS channel -> there is no real CBT to compute.
             channel_binding_value = b"" if cbt_value is None else cbt_value
 
-        original_test_case = ntlm.TEST_CASE
-        if strip_target_service:
-            # impacket's TEST_CASE flag suppresses the target-name AV pair.
-            ntlm.TEST_CASE = True
-        try:
-            type3, _ = auth_mod.ntlm_type3(
-                type1=type1,
-                server_challenge=server_challenge,
-                username=username,
-                password=password,
-                domain=domain,
-                nt_hash=nt_hash,
-                channel_binding_value=channel_binding_value,
-                service=service,
-                compute_mic=True,
-                version=version,
-            )
-        finally:
-            # Always restore the global TEST_CASE flag.
-            ntlm.TEST_CASE = original_test_case
+        # The probe changes only its own message. A provider-wide test flag
+        # would also affect simultaneous SQL, HTTP or WMI authentication.
+        type3, _ = auth_mod.ntlm_type3(
+            type1=type1,
+            server_challenge=server_challenge,
+            username=username,
+            password=password,
+            domain=domain,
+            nt_hash=nt_hash,
+            channel_binding_value=channel_binding_value,
+            service=service,
+            omit_target_service=strip_target_service,
+            compute_mic=True,
+            version=version,
+        )
 
         self.sendTDS(tds.TDS_SSPI, type3.getData())
         self.replies = self.parseReply(self.recvTDS()["Data"])
@@ -714,7 +781,9 @@ class _Tds(tds.MSSQL):
             sec_buffer_in.append(cbt_buf)
         else:
             # "missing" mode (or no tls-unique) -> send no channel-binding buffer.
-            logger.debug("SSPI EPA login: no channel-binding buffer (mode=%s)", cbt_mode)
+            logger.debug(
+                "SSPI EPA login: no channel-binding buffer (mode=%s)", cbt_mode
+            )
 
         _, out_buffers = client.auth.authorize(sec_buffer_in)
         type3 = bytes(out_buffers[0].Buffer)
@@ -770,9 +839,68 @@ class _Strategy:
     """One rung of the connection-strategy waterfall."""
 
     name: str
-    server_name: str   # host string to connect to (FQDN or short)
-    encrypt: str       # "true" | "strict" | "false"
-    remote_name: str   # remoteName for SPN / cert matching
+    server_name: str  # host string to connect to (FQDN or short)
+    encrypt: str  # "true" | "strict" | "false"
+    remote_name: str  # remoteName for SPN / cert matching
+
+
+def _tds_operation(
+    client: _Tds,
+    control: ReadControl | None,
+    label: str,
+    deadline: Deadline | None = None,
+) -> AbstractContextManager[ReadOperation | None]:
+    """Monitor only this TDS client's socket; existing callers remain opt-in.
+
+    impacket creates its socket during connect, so the monitor looks it up on
+    each cancellation request. DNS or native authentication can return late;
+    the calling thread still owns disconnect and waits for actual completion.
+    """
+    if control is None:
+        return nullcontext(None)  # Preserve other collectors' timeout policy.
+    if deadline is not None:
+        expires_at = (
+            min(deadline.expires_at, control.deadline.expires_at)
+            if control.deadline
+            else deadline.expires_at
+        )
+        control = ReadControl(
+            control.timeout_seconds, Deadline(expires_at), control.stop_event
+        )
+
+    def interrupt() -> None:
+        owned_socket = getattr(client, "socket", None)
+        if owned_socket is None or not hasattr(owned_socket, "shutdown"):
+            logger.debug(
+                "SQL cancellation is waiting for the owned socket to become available"
+            )
+            return
+        try:
+            owned_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            logger.debug("SQL cancellation found an already stopped socket")
+        finally:
+            # Windows' timed receive waits can survive shutdown alone. This is
+            # our client's socket, so close it before the owning thread performs
+            # its normal disconnect. The operation guard prevents late reuse.
+            owned_socket.close()
+
+    return control.operation(label, interrupt)
+
+
+def _disconnect_tds(client: _Tds, *, is_controlled: bool) -> None:
+    """Release only an opened client; an unstarted connection owns no socket."""
+    owned_socket = getattr(client, "socket", None)
+    if is_controlled and not callable(getattr(owned_socket, "close", None)):
+        logger.debug("SQL cleanup found no opened socket to release")
+        return
+    try:
+        client.disconnect()
+    except Exception as error:
+        if is_controlled:
+            logger.error("SQL client cleanup failed; the owning run must fail")
+            raise ClientCleanupError("SQL client cleanup failed") from error
+        logger.debug("SQL teardown failed on the legacy best-effort path")
 
 
 class MssqlConnection:
@@ -785,10 +913,12 @@ class MssqlConnection:
     credential is never replayed across strategies (AD lockout safety).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, read_control: ReadControl | None = None) -> None:
         self._client: Optional[_Tds] = None
         self._target: Optional[Target] = None
         self._strategy_name: Optional[str] = None
+        self.read_control = read_control
+        self._read_stopped = False
 
     # -- context manager -----------------------------------------------------
     def __enter__(self) -> "MssqlConnection":
@@ -802,8 +932,15 @@ class MssqlConnection:
         """Name of the connection strategy that succeeded (after connect)."""
         return self._strategy_name
 
-    def connect(self, target: str, auth: Auth, *, timeout: int = 15,
-                strict_first: bool = False) -> "MssqlConnection":
+    def connect(
+        self,
+        target: str,
+        auth: Auth,
+        *,
+        timeout: int = 15,
+        strict_first: bool = False,
+        deadline_seconds: float | None = None,
+    ) -> "MssqlConnection":
         """Open a connection to *target* using *auth*; return self.
 
         ``strict_first`` reorders the waterfall to try TDS 8.0 strict before
@@ -811,58 +948,115 @@ class MssqlConnection:
         Raises the last error if every strategy fails, or an auth error as soon
         as one is seen (no further attempts).
         """
+        from .deadline import Deadline
+
+        # Existing consumers retain their per-attempt timeout unless they opt
+        # into one budget for the entire encryption/hostname waterfall.
+        deadline = (
+            Deadline.after(deadline_seconds) if deadline_seconds is not None else None
+        )
+        if self.read_control is not None:
+            self.read_control.check()
         self._target = parse_target(target)
         strategies = self._build_strategies(self._target, strict_first=strict_first)
 
         last_error: Optional[Exception] = None
         for strat in strategies:
+            remaining = min(timeout, deadline.remaining()) if deadline else timeout
             client = _Tds(strat.server_name, self._target.port, strat.remote_name)
+            operation = None
             try:
-                client.connect(timeout=timeout)
-                authenticated = self._login(client, auth, strat)
-            except Exception as exc:  # noqa: BLE001 — classify, then decide
+                with _tds_operation(
+                    client, self.read_control, "SQL connection", deadline
+                ) as operation:
+                    client.connect(timeout=remaining)
+                    if operation is not None:
+                        operation.check()
+                        authenticated = self._login(client, auth, strat)
+                    elif deadline:
+                        with deadline.bound_socket(client.socket):
+                            authenticated = self._login(client, auth, strat)
+                    else:
+                        # The original per-attempt behavior remains an explicit choice.
+                        authenticated = self._login(client, auth, strat)
+            except BaseException as exc:
                 message = str(exc)
-                try:
-                    client.disconnect()
-                except Exception:  # noqa: BLE001 — best-effort teardown
-                    pass
-                if is_auth_error(message):
+                _disconnect_tds(client, is_controlled=self.read_control is not None)
+                if not isinstance(exc, Exception):
+                    logger.warning(
+                        "SQL connection was interrupted; its owned client has been released"
+                    )
+                    raise
+                if isinstance(exc, ReadStoppedError) or (
+                    operation is not None and operation.is_stopped
+                ):
+                    logger.warning(
+                        "SQL connection stopped; refusing another connection strategy"
+                    )
+                    self._read_stopped = True
+                    raise ReadStoppedError("SQL connection was stopped") from exc
+                if isinstance(
+                    exc, (CredentialInputError, KerberosAcquisitionError)
+                ) or is_auth_error(message):
                     # Credential failure — stop now to avoid AD account lockout.
-                    logger.warning("Auth error on strategy %s for %s; stopping waterfall: %s",
-                                   strat.name, target, message)
+                    logger.warning(
+                        "Auth error on strategy %s for %s; stopping waterfall: %s",
+                        strat.name,
+                        target,
+                        message,
+                    )
                     raise
                 # Transport/TLS error — record and try the next strategy.
-                logger.verbose("Strategy %s failed for %s (transport): %s",
-                               strat.name, target, message)
+                logger.verbose(
+                    "Strategy %s failed for %s (transport): %s",
+                    strat.name,
+                    target,
+                    message,
+                )
                 last_error = exc
                 continue
 
             if authenticated:
                 # Success — keep this client and remember which strategy worked.
-                logger.verbose("Connection strategy %s succeeded for %s", strat.name, target)
+                logger.verbose(
+                    "Connection strategy %s succeeded for %s", strat.name, target
+                )
                 self._client = client
                 self._strategy_name = strat.name
                 return self
 
             # Reached LOGIN without an exception but no LOGINACK -> auth failed.
             message = client.get_error_messages() or "login rejected (no LOGINACK)"
-            try:
-                client.disconnect()
-            except Exception:  # noqa: BLE001 — best-effort teardown
-                pass
+            _disconnect_tds(client, is_controlled=self.read_control is not None)
             if is_auth_error(message):
-                logger.warning("Auth rejection on strategy %s for %s; stopping waterfall: %s",
-                               strat.name, target, message)
+                logger.warning(
+                    "Auth rejection on strategy %s for %s; stopping waterfall: %s",
+                    strat.name,
+                    target,
+                    message,
+                )
                 raise SQLAuthError(message)
-            logger.verbose("Strategy %s rejected login for %s (non-auth): %s",
-                           strat.name, target, message)
+            logger.verbose(
+                "Strategy %s rejected login for %s (non-auth): %s",
+                strat.name,
+                target,
+                message,
+            )
             last_error = SQLAuthError(message)
 
         # Every strategy exhausted without success.
-        logger.error("All connection strategies failed for %s; last error: %s", target, last_error)
-        raise last_error or RuntimeError(f"all connection strategies failed for {target}")
+        logger.error(
+            "All connection strategies failed for %s; last error: %s",
+            target,
+            last_error,
+        )
+        raise last_error or RuntimeError(
+            f"all connection strategies failed for {target}"
+        )
 
-    def _build_strategies(self, target: Target, *, strict_first: bool) -> list[_Strategy]:
+    def _build_strategies(
+        self, target: Target, *, strict_first: bool
+    ) -> list[_Strategy]:
         """Build the ordered waterfall (encryption × hostname-form), per Go.
 
         FQDN targets also get short-hostname variants (some servers only accept
@@ -885,7 +1079,9 @@ class MssqlConnection:
                 remote_for_strict = fqdn
                 logger.verbose("Resolved IP %s to %s for cert matching", host, fqdn)
             else:
-                logger.verbose("No reverse DNS for %s; strict TLS may fail cert match", host)
+                logger.verbose(
+                    "No reverse DNS for %s; strict TLS may fail cert match", host
+                )
 
         if strict_first:
             # EPA found strict encryption -> lead with strict.
@@ -920,10 +1116,10 @@ class MssqlConnection:
             # driven without connecting, which is a caller bug worth naming.
             raise RuntimeError("login attempted before connect() parsed a target")
         spn = auth.spn or default_spn(strat.remote_name, self._target.port)
-        if auth.kerberos_ticket:
+        if auth.uses_kerberos():
             # Pass-the-ticket: Kerberos only (no NTLM fallback) — design D12.
             logger.verbose("Login via pass-the-ticket (Kerberos) for SPN %s", spn)
-            return self._kerberos_login(client, auth)
+            return self._kerberos_login(client, auth, spn=spn)
         if auth.use_sspi:
             # Current-user SSPI (Windows SSO) with the correct channel binding.
             logger.verbose("Login via current-user SSPI for SPN %s", spn)
@@ -933,70 +1129,118 @@ class MssqlConnection:
             logger.verbose("Login via SQL authentication as %s", auth.username)
             return client.login(None, auth.username, auth.password or "")
         # Domain NTLMv2 (+ EPA channel binding) or pass-the-hash.
-        logger.verbose("Login via domain NTLMv2%s for %s\\%s",
-                       " (pass-the-hash)" if auth.nt_hash else "", auth.domain, auth.username)
+        logger.verbose(
+            "Login via domain NTLMv2%s for %s\\%s",
+            " (pass-the-hash)" if auth.nt_hash else "",
+            auth.domain,
+            auth.username,
+        )
         return client.login_epa(
             database=None,
             username=auth.username or "",
             password=auth.password or "",
             domain=auth.domain,
             nt_hash=auth.nt_hash,
-            cbt_value=None,            # correct CBT from the live TLS channel
+            cbt_value=None,  # correct CBT from the live TLS channel
             service=DEFAULT_SERVICE_CLASS,
         )
 
-    def _kerberos_login(self, client: _Tds, auth: Auth) -> bool:
-        """Pass-the-ticket login: load the KRB-CRED into impacket's ccache.
+    def _kerberos_login(self, client: _Tds, auth: Auth, *, spn: str) -> bool:
+        """Pass a connection-local service ticket directly to impacket.
 
-        impacket's ``kerberosLogin`` reads tickets from a ccache file via the
-        ``KRB5CCNAME`` env var (``useCache=True``); we materialize the base64
-        ticket into a temp ccache and point impacket at it. Kerberos only.
+        Selecting the TGS here also preserves a caller's explicit SPN and port:
+        asking the TDS client to obtain one from a TGT would derive its own SPN.
+        No temporary cache, KRB5CCNAME change, or current-user fallback is used.
         """
-        import base64
-        import os
-        import tempfile
+        credentials = auth.kerberos_credentials
+        if credentials is None and (
+            auth.kerberos_ticket or auth.kerberos_ccache or auth.kerberos_keytab
+        ):
+            credentials = load_kerberos_credentials(
+                ticket=auth.kerberos_ticket,
+                ccache_file=auth.kerberos_ccache,
+                keytab_file=auth.kerberos_keytab,
+                username=auth.username,
+                realm=auth.kerberos_realm,
+            )
+        if credentials is not None:
+            material = credentials.service_ticket(spn, auth.kdc_host)
+            username, realm = credentials.username, credentials.realm
+        else:
+            if (
+                not auth.username
+                or not auth.kerberos_realm
+                or (auth.password is None and auth.nt_hash is None)
+            ):
+                logger.error("Kerberos SQL login has no usable explicit identity")
+                raise CredentialInputError(
+                    "Kerberos SQL authentication needs a credential source and realm"
+                )
+            from .auth import KerberosToken
 
-        from impacket.krb5.ccache import CCache
-
-        if not auth.kerberos_ticket:
-            # The caller reaches this method only after testing auth.kerberos_ticket, but
-            # asserting it here keeps the precondition with the code that depends on it.
-            raise ValueError("_kerberos_login requires auth.kerberos_ticket")
-        ccache = CCache()
-        ccache.fromKRBCRED(base64.b64decode(auth.kerberos_ticket, validate=True))
-        fd, path = tempfile.mkstemp(suffix=".ccache")
-        os.close(fd)
-        ccache.saveFile(path)
-        old = os.environ.get("KRB5CCNAME")
-        os.environ["KRB5CCNAME"] = path
-        try:
+            material = KerberosToken(
+                spn=spn,
+                realm=auth.kerberos_realm,
+                username=auth.username,
+                password=auth.password,
+                nt_hash=auth.nt_hash,
+                kdc_host=auth.kdc_host,
+            ).service_material()
+            username, realm = auth.username, auth.kerberos_realm
+        with authentication_diagnostics():
             return client.kerberosLogin(
                 None,
-                auth.username or "",
-                domain=auth.domain,
-                useCache=True,
+                username,
+                domain=realm,
+                TGS=material,
+                kdcHost=auth.kdc_host,
+                useCache=False,
             )
-        finally:
-            # Restore KRB5CCNAME and remove the temp ccache.
-            if old is None:
-                os.environ.pop("KRB5CCNAME", None)
-            else:
-                os.environ["KRB5CCNAME"] = old
-            try:
-                os.remove(path)
-            except OSError:
-                logger.debug("Could not remove temp ccache %s", path)
 
-    def query(self, sql: str, database: Optional[str] = None) -> list[dict]:
+    def query(
+        self,
+        sql: str,
+        database: Optional[str] = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[dict]:
         """Run *sql* and return the result rows as a list of dicts.
 
         Each row is the impacket row dict (column name -> value). Raises if the
         connection is not open or the server returns an error token.
         """
+        if self._read_stopped:
+            logger.warning(
+                "Refusing another SQL read after this connection was stopped"
+            )
+            raise ReadStoppedError("SQL connection was already stopped")
         if self._client is None:
             raise RuntimeError("query() called before a successful connect()")
-        logger.debug("Running query (%d chars) on db=%s", len(sql), database or "master")
-        rows = self._client.RunSQLQuery(database, sql)
+        logger.debug(
+            "Running query (%d chars) on db=%s", len(sql), database or "master"
+        )
+        control = self.read_control
+        if timeout_seconds is not None:
+            control = (
+                ReadControl(timeout_seconds, control.deadline, control.stop_event)
+                if control
+                else ReadControl(timeout_seconds)
+            )
+        operation = None
+        try:
+            with _tds_operation(self._client, control, "SQL query") as operation:
+                rows = self._client.RunSQLQuery(database, sql)
+        except BaseException as error:
+            if isinstance(error, ReadStoppedError) or (
+                operation is not None and operation.is_stopped
+            ):
+                self._read_stopped = True
+                logger.warning(
+                    "SQL read stopped; closing the connection before further collection"
+                )
+                self.close()
+                raise ReadStoppedError("SQL query was stopped") from error
+            raise  # Existing SQL errors retain their normal caller policy.
         # impacket returns a list of dicts already; normalize to plain dicts and
         # map SQL NULL to Python None. impacket represents a NULL column value as
         # the literal string "NULL" (see tds.MSSQL.parseRow), which would
@@ -1015,9 +1259,10 @@ class MssqlConnection:
         """Close the connection (idempotent)."""
         if self._client is not None:
             try:
-                self._client.disconnect()
-            except Exception as exc:  # noqa: BLE001 — best-effort teardown
-                logger.debug("Error during disconnect (ignored): %s", exc)
+                _disconnect_tds(
+                    self._client,
+                    is_controlled=self.read_control is not None or self._read_stopped,
+                )
             finally:
                 self._client = None
 
@@ -1045,7 +1290,13 @@ class _ProbeOutcome:
     error_message: str = ""
 
 
-def detect_epa(target: str, auth: Auth, *, timeout: int = 15) -> dict:
+def detect_epa(
+    target: str,
+    auth: Auth,
+    *,
+    timeout: int = 15,
+    read_control: ReadControl | None = None,
+) -> dict:
     """Determine EPA enforcement for *target* using *auth* (LDAP/domain creds).
 
     Returns a dict with at least::
@@ -1066,7 +1317,11 @@ def detect_epa(target: str, auth: Auth, *, timeout: int = 15) -> dict:
     parsed = parse_target(target)
     spn = auth.spn or default_spn(parsed.host, parsed.port)
     auth_method = "sspi" if auth.use_sspi else "explicit"
-    probe = _make_prober(parsed, auth, spn, timeout=timeout)
+    probe = (
+        _make_prober(parsed, auth, spn, timeout=timeout, read_control=read_control)
+        if read_control is not None
+        else _make_prober(parsed, auth, spn, timeout=timeout)
+    )
 
     normal = probe("normal")
     # Prereq: baseline must authenticate or fail with a plain "login failed".
@@ -1078,16 +1333,25 @@ def detect_epa(target: str, auth: Auth, *, timeout: int = 15) -> dict:
     force_encryption = normal.is_strict or normal.encryption_flag == ENCRYPT_REQ
     if normal.is_strict or normal.encryption_flag == ENCRYPT_REQ:
         # Encrypted connection -> probe channel-binding enforcement.
-        logger.verbose("EPA: encrypted connection to %s; probing channel binding", target)
+        logger.verbose(
+            "EPA: encrypted connection to %s; probing channel binding", target
+        )
         extended = _classify_binding(probe, "bogus_cbt", "missing_cbt", auth_method)
     elif normal.encryption_flag in (ENCRYPT_OFF, ENCRYPT_ON):
         # Unencrypted connection -> probe service (SPN) binding enforcement.
-        logger.verbose("EPA: unencrypted connection to %s; probing service binding", target)
-        extended = _classify_binding(probe, "bogus_service", "missing_service", auth_method)
+        logger.verbose(
+            "EPA: unencrypted connection to %s; probing service binding", target
+        )
+        extended = _classify_binding(
+            probe, "bogus_service", "missing_service", auth_method
+        )
     else:
         # NOT_SUP or anything unexpected -> nothing usable to probe.
-        logger.warning("EPA: unexpected encryption flag %d for %s; verdict Unknown",
-                       normal.encryption_flag, target)
+        logger.warning(
+            "EPA: unexpected encryption flag %d for %s; verdict Unknown",
+            normal.encryption_flag,
+            target,
+        )
         extended = "Unknown"
 
     verdict = {
@@ -1101,8 +1365,12 @@ def detect_epa(target: str, auth: Auth, *, timeout: int = 15) -> dict:
     return verdict
 
 
-def _classify_binding(probe: Callable[[str], _ProbeOutcome], bogus_mode: str,
-                      missing_mode: str, auth_method: str) -> str:
+def _classify_binding(
+    probe: Callable[[str], _ProbeOutcome],
+    bogus_mode: str,
+    missing_mode: str,
+    auth_method: str,
+) -> str:
     """Map a bogus-then-missing probe pair to Off / Allowed / Required.
 
     Accepting a *bogus* binding -> EPA Off. Rejecting bogus but accepting
@@ -1125,7 +1393,14 @@ def _classify_binding(probe: Callable[[str], _ProbeOutcome], bogus_mode: str,
     return "Allowed"
 
 
-def _make_prober(target: Target, auth: Auth, spn: str, *, timeout: int) -> Callable[[str], _ProbeOutcome]:
+def _make_prober(
+    target: Target,
+    auth: Auth,
+    spn: str,
+    *,
+    timeout: int,
+    read_control: ReadControl | None = None,
+) -> Callable[[str], _ProbeOutcome]:
     """Return a ``probe(mode)`` that runs one EPA login probe on a fresh conn.
 
     A fresh connection per probe (matching MSSQLHound) ensures no connection
@@ -1145,31 +1420,47 @@ def _make_prober(target: Target, auth: Auth, spn: str, *, timeout: int) -> Calla
 
     def probe(mode: str) -> _ProbeOutcome:
         client = _Tds(target.host, target.port, target.host)
+        operation = None
         try:
-            client.connect(timeout=timeout)
-            if auth.use_sspi:
-                target_spn, cbt_mode = sspi_spec[mode]
-                authenticated = client.login_sspi_epa(target_spn=target_spn, cbt_mode=cbt_mode)
-            else:
-                params = _explicit_mode_params(mode, service_class)
-                authenticated = client.login_epa(
-                    database=None,
-                    username=auth.username or "",
-                    password=auth.password or "",
-                    domain=auth.domain,
-                    nt_hash=auth.nt_hash,
-                    **params,
-                )
+            with _tds_operation(client, read_control, "SQL EPA probe") as operation:
+                client.connect(timeout=timeout)
+                if operation is not None:
+                    operation.check()
+                # Unmonitored callers preserve their existing per-attempt timeout.
+                if auth.use_sspi:
+                    target_spn, cbt_mode = sspi_spec[mode]
+                    authenticated = client.login_sspi_epa(
+                        target_spn=target_spn, cbt_mode=cbt_mode
+                    )
+                else:
+                    params = _explicit_mode_params(mode, service_class)
+                    authenticated = client.login_epa(
+                        database=None,
+                        username=auth.username or "",
+                        password=auth.password or "",
+                        domain=auth.domain,
+                        nt_hash=auth.nt_hash,
+                        **params,
+                    )
             enc, strict = client.epa_encryption_flag, client.epa_is_strict
             if authenticated:
                 logger.debug("EPA probe %s on %s: success", mode, target.host)
-                return _ProbeOutcome(success=True, encryption_flag=enc, is_strict=strict)
+                return _ProbeOutcome(
+                    success=True, encryption_flag=enc, is_strict=strict
+                )
             outcome = _classify_error_text(client.get_error_messages())
             outcome.encryption_flag = enc
             outcome.is_strict = strict
-            logger.debug("EPA probe %s on %s: %s", mode, target.host, outcome.error_message)
+            logger.debug(
+                "EPA probe %s on %s: %s", mode, target.host, outcome.error_message
+            )
             return outcome
         except Exception as ex:  # noqa: BLE001 — one bad probe must not abort all
+            if isinstance(ex, ReadStoppedError) or (
+                operation is not None and operation.is_stopped
+            ):
+                logger.warning("EPA probe stopped; refusing further probe logins")
+                raise ReadStoppedError("SQL EPA probe was stopped") from ex
             logger.debug("EPA probe %s on %s raised: %s", mode, target.host, ex)
             return _ProbeOutcome(
                 error_message=str(ex),
@@ -1177,10 +1468,7 @@ def _make_prober(target: Target, auth: Auth, spn: str, *, timeout: int) -> Calla
                 is_strict=getattr(client, "epa_is_strict", False),
             )
         finally:
-            try:
-                client.disconnect()
-            except Exception:  # noqa: BLE001 — best-effort teardown
-                pass
+            _disconnect_tds(client, is_controlled=read_control is not None)
 
     return probe
 
@@ -1188,11 +1476,23 @@ def _make_prober(target: Target, auth: Auth, spn: str, *, timeout: int) -> Calla
 def _explicit_mode_params(mode: str, service_class: str) -> dict:
     """Map an EPA probe mode to ``_Tds.login_epa`` keyword arguments."""
     if mode == "normal":
-        return {"cbt_value": None, "service": service_class, "strip_target_service": False}
+        return {
+            "cbt_value": None,
+            "service": service_class,
+            "strip_target_service": False,
+        }
     if mode == "bogus_cbt":
-        return {"cbt_value": BOGUS_CBT, "service": service_class, "strip_target_service": False}
+        return {
+            "cbt_value": BOGUS_CBT,
+            "service": service_class,
+            "strip_target_service": False,
+        }
     if mode == "missing_cbt":
-        return {"cbt_value": b"", "service": service_class, "strip_target_service": False}
+        return {
+            "cbt_value": b"",
+            "service": service_class,
+            "strip_target_service": False,
+        }
     if mode == "bogus_service":
         return {"cbt_value": None, "service": "cifs", "strip_target_service": False}
     if mode == "missing_service":

@@ -37,8 +37,10 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+from threading import Event, Lock
 import queue as _queue
 from typing import Callable, Iterable, Iterator
+from ..collection.errors import FatalCollectionError
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,10 @@ def broadcast_done(streams: dict[str, _queue.Queue]) -> None:
         stream.put(DONE)
 
 
+class CollectionStopped(FatalCollectionError):
+    """The consumer stopped and producers must no longer enqueue rows."""
+
+
 class StreamBridge:
     """One collection run's per-table queue registry + emit-resource factory.
 
@@ -92,7 +98,7 @@ class StreamBridge:
     the producer. It only owns the queues and the drain/emit machinery.
     """
 
-    def __init__(self, table_names: Iterable[str], *, maxsize: int = 1000) -> None:
+    def __init__(self, table_names: Iterable[str], *, maxsize: int = 1000, strict_tables: bool = False) -> None:
         """Create one bounded queue per table name.
 
         Args:
@@ -101,6 +107,10 @@ class StreamBridge:
             maxsize: Per-queue capacity (backpressure bound). Defaults to 1000.
         """
         self._table_names: tuple[str, ...] = tuple(table_names)
+        self._cancelled = Event()
+        self._cancel_lock = Lock()
+        self._cancel_reason: str | None = None
+        self._strict_tables = strict_tables
         self.streams: dict[str, _queue.Queue] = build_streams(self._table_names, maxsize=maxsize)
         logger.debug("StreamBridge created with %d table queue(s) (maxsize=%d)",
                      len(self._table_names), maxsize)
@@ -111,6 +121,41 @@ class StreamBridge:
         return self._table_names
 
     # -- producer side -----------------------------------------------------
+    @property
+    def is_cancelled(self) -> bool:
+        """Whether this run's consumer or caller has asked all streams to stop."""
+        return self._cancelled.is_set()
+
+    def cancel(self, reason: str) -> None:
+        """Stop blocked queue operations without waiting for another DONE marker.
+
+        This stops queues, not remote API calls. The caller must also interrupt
+        or bound its clients before joining worker threads. Buffered rows remain
+        available to a consumer that is still running.
+        """
+        if not reason.strip():
+            logger.error("Stream cancellation needs a reason")
+            raise ValueError("Stream cancellation needs a reason")
+        with self._cancel_lock:
+            if self._cancelled.is_set():
+                # The first reason identifies the event that stopped this run.
+                return
+            self._cancel_reason = reason
+            self._cancelled.set()
+            logger.warning("Stopping collection streams: %s", reason)
+
+    def _put_until_stopped(self, stream: _queue.Queue, row: object) -> None:
+        """A bounded wait lets a cancelled consumer release a blocked producer."""
+        while not self._cancelled.is_set():
+            try:
+                stream.put(row, timeout=0.1)
+                return
+            except _queue.Full:
+                # Queue pressure is ordinary; cancellation is checked each wait.
+                continue
+        logger.warning("Collection row was not queued because collection stopped")
+        raise CollectionStopped(self._cancel_reason or "Collection stopped")
+
     def put(self, table_name: str, row: dict) -> None:
         """Push one row onto *table_name*'s queue (blocks if the queue is full).
 
@@ -121,9 +166,12 @@ class StreamBridge:
         if stream is None:
             # A row for a table we never registered: log and drop. Raising here
             # would kill the producer thread and strand every other table.
+            if self._strict_tables:
+                logger.error("Cannot save row for unregistered table %r", table_name)
+                raise ValueError(f"Unregistered collection table {table_name!r}")
             logger.warning("Dropping row for unregistered table %r", table_name)
             return
-        stream.put(row)
+        self._put_until_stopped(stream, row)
 
     def broadcast_done(self) -> None:
         """Place :data:`DONE` on every queue so all emit resources can finish.
@@ -131,7 +179,14 @@ class StreamBridge:
         Call once, after the producer has finished every target (quiescence).
         """
         logger.debug("Broadcasting DONE to %d table queue(s)", len(self.streams))
-        broadcast_done(self.streams)
+        for stream in self.streams.values():
+            try:
+                self._put_until_stopped(stream, DONE)
+            except CollectionStopped:
+                # Cancelled consumers notice the event after draining any rows;
+                # they do not need another marker in a possibly full queue.
+                logger.debug("Cancelled streams do not need DONE markers")
+                return
 
     def drain_to_unblock(self) -> None:
         """Discard any buffered rows from every queue without blocking.
@@ -162,7 +217,14 @@ class StreamBridge:
             logger.error("drain_stream called for unregistered table %r", table_name)
             return
         while True:
-            item = stream.get()
+            try:
+                item = stream.get(timeout=0.1)
+            except _queue.Empty:
+                if self._cancelled.is_set():
+                    logger.warning("Closing collection stream %r after cancellation", table_name)
+                    return
+                # An ordinary temporary gap must not look like end-of-stream.
+                continue
             if item is DONE:
                 logger.debug("Stream %r received DONE; closing emit resource", table_name)
                 return

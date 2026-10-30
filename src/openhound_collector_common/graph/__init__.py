@@ -13,9 +13,14 @@ Re-exports the two reusable building blocks:
 
 from .graph_edge import GraphEdge, GraphEdgeProperties
 from .stub_node import StubNode
+from .evidence import EvidenceProperties, merge_sources
+from .files import GraphFileWriter
 
 __all__ = [
     "GraphEdge",
     "GraphEdgeProperties",
     "StubNode",
+    "EvidenceProperties",
+    "merge_sources",
+    "GraphFileWriter",
 ]

@@ -49,6 +49,9 @@ dependencies = [
     "ldap3>=2.10.2rc4",
     # DNS SRV (_ldap._tcp) + A-record DC/SPN discovery (discovery/dns.py).
     "dnspython>=2.4.0",
+    # Owner-approved cross-platform system memory measurements. BSD-3-Clause;
+    # importing/using the new resource monitor is opt-in for existing collectors.
+    "psutil>=7.2.2",
     # Kerberos ASN.1 codecs used transitively by impacket.krb5; pinned for reproducibility.
     "pyasn1",
     "pyasn1-modules",

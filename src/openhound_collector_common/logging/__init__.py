@@ -38,9 +38,21 @@ from .log_context import (
     unregister_resource_complete_callback,
     with_log_context,
 )
+from .console import (
+    ConsoleSettings,
+    GoConsoleFormatter,
+    SecretRedactor,
+    console_supports_color,
+    log_event,
+)
 
 __all__ = [
     "VERBOSE",
+    "GoConsoleFormatter",
+    "ConsoleSettings",
+    "SecretRedactor",
+    "console_supports_color",
+    "log_event",
     "LogContextFilter",
     "VerboseLogger",
     "cached_with_log",

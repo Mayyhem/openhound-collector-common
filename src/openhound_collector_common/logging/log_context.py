@@ -207,6 +207,13 @@ class LogContextFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "_oh_original_message"):
+            # Keep the original message/context for an opt-in structured formatter.
+            # Existing handlers still receive the same prefixed message as before.
+            record._oh_original_message = record.getMessage()
+            record._oh_target = _current_target.get(None)
+            record._oh_phase = _current_phase.get(None)
+        # Another handler may already have saved this record's original context.
         # The same LogRecord may pass through multiple handlers; mutating
         # record.msg each time would duplicate the prefix, so a sentinel attribute
         # short-circuits reruns.

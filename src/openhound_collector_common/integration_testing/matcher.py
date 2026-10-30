@@ -1,14 +1,57 @@
 """Wildcard/pattern matching — port of the PowerShell kit's Test-*Pattern helpers."""
+
 from __future__ import annotations
 
 import fnmatch
+import re
 
 from openhound_collector_common.integration_testing.cases import EdgeCase, NodePattern
 from openhound_collector_common.integration_testing.graph import Edge, Graph, Node
 
 
-def property_match(actual, expected) -> bool:
+def endpoint_id_match(
+    actual: str, pattern: str, *, match_name_before_at: bool = False
+) -> bool:
+    """Match reference IDs with only * and ? wildcards, ignoring letter case.
+
+    Square brackets are ordinary characters. The optional name rule compares
+    only the portion before @ for patterns without wildcards, matching tools
+    that leave the collected server suffix unspecified in their fixtures.
+    """
+    if "*" in pattern or "?" in pattern:
+        # Escape everything first so brackets and other punctuation stay literal.
+        expression = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+        return (
+            re.fullmatch(expression, actual, flags=re.IGNORECASE | re.DOTALL)
+            is not None
+        )
+    if match_name_before_at and "@" in pattern:
+        return actual.split("@", 1)[0].casefold() == pattern.split("@", 1)[0].casefold()
+    # Exact matching is the ordinary case and needs no per-edge diagnostic.
+    return actual.casefold() == pattern.casefold()
+
+
+def exact_value_match(actual: object, expected: object) -> bool:
+    """Compare JSON values without accepting changed types, case, or list order."""
+    # These are pure assertion predicates; the runner reports any failed case.
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(actual, list) and isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            exact_value_match(a, e) for a, e in zip(actual, expected)
+        )
+    if isinstance(actual, dict) and isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            exact_value_match(actual[key], expected[key]) for key in actual
+        )
+    return actual == expected
+
+
+def property_match(actual, expected, *, exact: bool = False) -> bool:
     """Match one property value. Ports Test-PropertyMatch."""
+    if exact:
+        return exact_value_match(actual, expected)
+    # Existing collectors retain their pattern/subset matching rules by default.
     if actual is None and expected is None:
         return True
     if actual is None or expected is None:
@@ -64,6 +107,30 @@ def edge_matches(edge: Edge, graph: Graph, case: EdgeCase) -> bool:
     """Ports Test-EdgePattern: exact kind + endpoint nodes + edge properties."""
     if edge.kind != case.kind:
         return False
+    if case.source_id_pattern is not None or case.target_id_pattern is not None:
+        # ID assertions do not depend on a node being present in the reference
+        # output. Additional node filters, when supplied, still require it.
+        for actual, pattern, node_pattern in (
+            (edge.start, case.source_id_pattern, case.source),
+            (edge.end, case.target_id_pattern, case.target),
+        ):
+            if pattern is not None and not endpoint_id_match(
+                actual, pattern, match_name_before_at=case.match_name_before_at
+            ):
+                return False
+            if node_pattern is not None:
+                node = graph.node(actual)
+                if node is None or not node_matches(node, node_pattern):
+                    return False
+            # No node filter means the endpoint's ID is sufficient.
+        return not case.properties or all(
+            key in edge.properties
+            and property_match(
+                edge.properties[key], expected, exact=case.exact_property_values
+            )
+            for key, expected in case.properties.items()
+        )
+    # Existing consumers continue to require both endpoint nodes.
     src, tgt = graph.node(edge.start), graph.node(edge.end)
     if src is None or tgt is None:
         return False
@@ -73,6 +140,8 @@ def edge_matches(edge: Edge, graph: Graph, case: EdgeCase) -> bool:
         return False
     if case.properties:
         for key, expected in case.properties.items():
-            if not property_match(edge.properties.get(key), expected):
+            if not property_match(
+                edge.properties.get(key), expected, exact=case.exact_property_values
+            ):
                 return False
     return True

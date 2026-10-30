@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import zipfile
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,6 +21,7 @@ class Node:
     id: str
     kinds: list[str] = field(default_factory=list)
     properties: dict = field(default_factory=dict)
+    source_kind: str | None = None
 
 
 @dataclass
@@ -28,12 +30,17 @@ class Edge:
     start: str
     end: str
     properties: dict = field(default_factory=dict)
+    start_match_by: str = "id"
+    end_match_by: str = "id"
+    source_kind: str | None = None
 
 
 class Graph:
     """Loaded nodes + edges with an id->Node index and a kind filter for edges."""
 
     def __init__(self, nodes: list[Node], edges: list[Edge]) -> None:
+        # Preserve records before the existing convenient node merge mutates them.
+        self.raw_nodes = deepcopy(nodes)
         self.edges = edges
         self._by_id: dict[str, Node] = {}
         deduped: list[Node] = []
@@ -78,24 +85,34 @@ def _iter_payload_files(path: Path) -> list[tuple[str, str]]:
     raise ValueError(f"load_graph: {path} is neither a .zip nor a directory")
 
 
-def load_graph(path: str | Path) -> Graph:
+def load_graph(path: str | Path, *, validate_raw: bool = False) -> Graph:
     """Load a Graph from a directory of *.json files or a .zip of them."""
     path = Path(path)
     nodes: list[Node] = []
     edges: list[Edge] = []
     files = _iter_payload_files(path)
     logger.info("load_graph: reading %d payload file(s) from %s", len(files), path)
-    for name, text in files:
+    if validate_raw:
+        from .raw_checks import parse_checked_payloads
+        payloads = parse_checked_payloads(files)
+    else:
+        # Existing consumers opt into stricter file checks when ready.
+        payloads = [(name, json.loads(text)) for name, text in files]
+    for name, payload in payloads:
         try:
-            graph = (json.loads(text).get("graph") or {})
+            graph = (payload.get("graph") or {})
         except Exception:
             logger.error("load_graph: failed to parse payload %s", name)
             raise
         for raw in graph.get("nodes") or []:
             nodes.append(Node(id=raw["id"], kinds=list(raw.get("kinds") or []),
-                              properties=dict(raw.get("properties") or {})))
+                              properties=dict(raw.get("properties") or {}),
+                              source_kind=(payload.get("metadata") or {}).get("source_kind")))
         for raw in graph.get("edges") or []:
             edges.append(Edge(kind=raw["kind"], start=raw["start"]["value"],
-                              end=raw["end"]["value"], properties=dict(raw.get("properties") or {})))
+                              end=raw["end"]["value"], properties=dict(raw.get("properties") or {}),
+                              start_match_by=raw["start"].get("match_by", "id"),
+                              end_match_by=raw["end"].get("match_by", "id"),
+                              source_kind=(payload.get("metadata") or {}).get("source_kind")))
     logger.info("load_graph: %d nodes, %d edges", len(nodes), len(edges))
     return Graph(nodes, edges)

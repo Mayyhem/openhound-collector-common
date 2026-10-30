@@ -1,16 +1,33 @@
 """Runs edge/node cases + invariants against a Graph; prints + returns a Summary."""
+
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
 from openhound_collector_common.integration_testing import coverage as _coverage
-from openhound_collector_common.integration_testing.cases import CountSpec, EdgeCase, NodeCase, NodePattern
+from openhound_collector_common.integration_testing.cases import (
+    CountSpec,
+    EdgeCase,
+    NodeCase,
+    NodePattern,
+)
 from openhound_collector_common.integration_testing.graph import Graph
-from openhound_collector_common.integration_testing.matcher import edge_matches, node_matches
+from openhound_collector_common.integration_testing.matcher import (
+    edge_matches,
+    node_matches,
+)
 from openhound_collector_common.integration_testing.results import (
-    FAIL, PASS, SKIP, Result, Summary, write_results_json)
+    FAIL,
+    PASS,
+    SKIP,
+    Result,
+    Summary,
+    write_results_json,
+    require_case_results,
+)
 
 Invariant = Callable[[Graph], Result]
 
@@ -31,24 +48,69 @@ def _no_match_detail(candidates: int) -> str:
     """
     if candidates == 0:
         return "not found"
-    return (f"property mismatch ({candidates} candidate"
-            f"{'s' if candidates != 1 else ''} of this kind, none matched)")
+    return (
+        f"property mismatch ({candidates} candidate"
+        f"{'s' if candidates != 1 else ''} of this kind, none matched)"
+    )
 
 
 def run_edge_case(case: EdgeCase, graph: Graph) -> Result:
-    if not case.source and not case.target and not case.properties:
-        return Result(case.id, case.kind, case.description, SKIP, "coverage placeholder")
+    if (
+        not case.source
+        and not case.target
+        and not case.properties
+        and case.source_id_pattern is None
+        and case.target_id_pattern is None
+    ):
+        return Result(
+            case.id, case.kind, case.description, SKIP, "coverage placeholder"
+        )
     candidates = graph.edges_of_kind(case.kind)
-    matches = [e for e in candidates if edge_matches(e, graph, case)]
+    # A reference may require every edge with matching endpoints to have its
+    # properties. Filtering properties first would hide a second incorrect edge.
+    identity_case = (
+        replace(case, properties=None) if case.properties_must_match_all else case
+    )
+    matches = [e for e in candidates if edge_matches(e, graph, identity_case)]
     n = len(matches)
     if case.negative:
-        return (Result(case.id, case.kind, case.description, PASS, "correctly absent") if n == 0
-                else Result(case.id, case.kind, case.description, FAIL, f"incorrectly present ({n})", n))
+        return (
+            Result(case.id, case.kind, case.description, PASS, "correctly absent")
+            if n == 0
+            else Result(
+                case.id,
+                case.kind,
+                case.description,
+                FAIL,
+                f"incorrectly present ({n})",
+                n,
+            )
+        )
     if n == 0:
-        return Result(case.id, case.kind, case.description, FAIL,
-                      _no_match_detail(len(list(candidates))), 0)
+        return Result(
+            case.id,
+            case.kind,
+            case.description,
+            FAIL,
+            _no_match_detail(len(list(candidates))),
+            0,
+        )
     if not _count_ok(case.count, n):
-        return Result(case.id, case.kind, case.description, FAIL, f"wrong count (found {n})", n)
+        return Result(
+            case.id, case.kind, case.description, FAIL, f"wrong count (found {n})", n
+        )
+    if case.properties_must_match_all and any(
+        not edge_matches(edge, graph, case) for edge in matches
+    ):
+        return Result(
+            case.id,
+            case.kind,
+            case.description,
+            FAIL,
+            "property mismatch on a matching edge",
+            n,
+        )
+    # All matching edges satisfied the requested assertions.
     return Result(case.id, case.kind, case.description, PASS, "", n)
 
 
@@ -58,27 +120,44 @@ def run_node_case(case: NodeCase, graph: Graph) -> Result:
     n = len(matches)
     label = case.kinds[0] if case.kinds else "node"
     if case.negative:
-        return (Result(case.id, label, case.description, PASS, "correctly absent") if n == 0
-                else Result(case.id, label, case.description, FAIL, f"incorrectly present ({n})", n))
+        return (
+            Result(case.id, label, case.description, PASS, "correctly absent")
+            if n == 0
+            else Result(
+                case.id, label, case.description, FAIL, f"incorrectly present ({n})", n
+            )
+        )
     if n == 0:
         # Same distinction as run_edge_case: nodes of the right KIND existing but
         # failing the property filter is a different problem from none existing.
         kind_only = NodePattern(kinds=case.kinds, properties=None)
         candidates = sum(1 for nd in graph.nodes if node_matches(nd, kind_only))
-        return Result(case.id, label, case.description, FAIL,
-                      _no_match_detail(candidates), 0)
+        return Result(
+            case.id, label, case.description, FAIL, _no_match_detail(candidates), 0
+        )
     if not _count_ok(case.count, n):
-        return Result(case.id, label, case.description, FAIL, f"wrong count (found {n})", n)
+        return Result(
+            case.id, label, case.description, FAIL, f"wrong count (found {n})", n
+        )
     return Result(case.id, label, case.description, PASS, "", n)
 
 
 def _line(r: Result) -> str:
-    return f"{r.kind}: {r.description} - {r.outcome}" + (f" ({r.detail})" if r.detail else "")
+    return f"{r.kind}: {r.description} - {r.outcome}" + (
+        f" ({r.detail})" if r.detail else ""
+    )
 
 
-def run_suite(graph: Graph, edge_cases: list[EdgeCase], node_cases: list[NodeCase],
-              invariants: list[Invariant] | None = None, schema_path: Path | None = None,
-              results_path: Path | None = None, log: Callable[[str], None] = print) -> Summary:
+def run_suite(
+    graph: Graph,
+    edge_cases: list[EdgeCase],
+    node_cases: list[NodeCase],
+    invariants: list[Invariant] | None = None,
+    schema_path: Path | None = None,
+    results_path: Path | None = None,
+    log: Callable[[str], None] = print,
+    require_all_cases: bool = False,
+) -> Summary:
     summary = Summary()
     log(f"Total nodes found: {len(graph.nodes)}")
     log(f"Total edges found: {len(graph.edges)}")
@@ -96,6 +175,11 @@ def run_suite(graph: Graph, edge_cases: list[EdgeCase], node_cases: list[NodeCas
         r = run_node_case(ncase, graph)
         summary.results.append(r)
         log(_line(r))
+    if require_all_cases:
+        require_case_results(
+            summary, [case.id for case in edge_cases] + [case.id for case in node_cases]
+        )
+    # Other collectors keep their existing optional-placeholder behavior.
     for inv in invariants or []:
         # An invariant is arbitrary caller code; a bug in one must not crash the whole
         # run (the suite never raises on a failing check) — turn an exception into a FAIL.
@@ -103,7 +187,9 @@ def run_suite(graph: Graph, edge_cases: list[EdgeCase], node_cases: list[NodeCas
         try:
             r = inv(graph)
         except Exception as exc:  # noqa: BLE001 - surface any invariant crash as a FAIL result
-            r = Result(name, "invariant", f"{name} raised an exception", FAIL, str(exc)[:120])
+            r = Result(
+                name, "invariant", f"{name} raised an exception", FAIL, str(exc)[:120]
+            )
         summary.results.append(r)
         log(_line(r))
 

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from collections.abc import Sequence
 from typing import Callable, Iterable, TypeVar
 
 from openhound_collector_common.integration_testing.graph import Edge, Graph, Node
+from .exact import ExactDifference, PropertyAllowance, edge_key, exact_differences
 
 # _kind_rollup is called once for nodes and once for edges. A `Node | Edge` parameter would
 # force each caller's lambda to handle both, so the accessor could not simply reach for
@@ -93,12 +95,20 @@ class ComparisonReport:
     # kind -> {only_in_baseline:[...], only_in_candidate:[...]}
     node_kind_rollup: dict = field(default_factory=dict)
     edge_kind_rollup: dict = field(default_factory=dict)
+    exact_requested: bool = False
+    exact_record_differences: list[ExactDifference] = field(default_factory=list)
+    allowances: tuple[PropertyAllowance, ...] = ()
+
+    @property
+    def is_exact_match(self) -> bool | None:
+        """Return the requested exact verdict, or None when only losses were checked."""
+        return not self.exact_record_differences if self.exact_requested else None
 
     def to_dict(self) -> dict:
         def pd(d: PropDiff) -> dict:
             return {"key": d.key, "kind": d.kind, "only_in_baseline": d.only_in_baseline,
                     "only_in_candidate": d.only_in_candidate, "changed": d.changed}
-        return {
+        result = {
             "nodes_only_in_baseline": self.nodes_only_in_baseline,
             "nodes_only_in_candidate": self.nodes_only_in_candidate,
             "edges_only_in_baseline": self.edges_only_in_baseline,
@@ -107,6 +117,13 @@ class ComparisonReport:
             "edge_prop_diffs": [pd(d) for d in self.edge_prop_diffs],
             "node_kind_rollup": self.node_kind_rollup, "edge_kind_rollup": self.edge_kind_rollup,
         }
+        if self.exact_requested:
+            result.update({
+                "is_exact_match": self.is_exact_match,
+                "exact_record_differences": [asdict(item) for item in self.exact_record_differences],
+                "allowances": [asdict(item) for item in self.allowances],
+            })
+        return result
 
     def regressions(self) -> list[Regression]:
         """Every way the candidate has less than the baseline.
@@ -172,6 +189,14 @@ class ComparisonReport:
         code; additions follow so a grown graph is still reviewed rather than
         silently accepted.
         """
+        if self.exact_requested:
+            log(f"EXACT COMPARISON: {len(self.exact_record_differences)} differing record(s)")
+            for difference in self.exact_record_differences:
+                log(f"  {difference.entity} {difference.identity}: baseline {difference.baseline_count}, candidate {difference.candidate_count}")
+            for allowance in self.allowances:
+                log(f"  Allowance: {allowance.entity} {allowance.kind}.{allowance.property} ({allowance.mode}): {allowance.reason}")
+            log("RESULT: exact match" if self.is_exact_match else "RESULT: graphs differ")
+            return
         regs = self.regressions()
         bar = "=" * 72
         log(bar)
@@ -236,13 +261,15 @@ def _kind_rollup(baseline_items: Iterable[_Item], candidate_items: Iterable[_Ite
     return roll
 
 
-def compare_graphs(baseline: Graph, candidate: Graph) -> ComparisonReport:
+def compare_graphs(baseline: Graph, candidate: Graph, *, exact: bool = False, allowances: Sequence[PropertyAllowance] = ()) -> ComparisonReport:
     """Diff *candidate* against *baseline*. Baseline is what came first.
 
     Membership and property differences are reported in both directions; only the
     baseline-has/candidate-lacks direction counts as a regression (see regressions()).
     """
-    rep = ComparisonReport()
+    rep = ComparisonReport(exact_requested=exact, allowances=tuple(allowances))
+    if exact:
+        rep.exact_record_differences = exact_differences(baseline, candidate, allowances)
     b_nodes = {n.id: n for n in baseline.nodes}
     c_nodes = {n.id: n for n in candidate.nodes}
     rep.nodes_only_in_baseline = sorted(set(b_nodes) - set(c_nodes))
@@ -253,18 +280,33 @@ def compare_graphs(baseline: Graph, candidate: Graph) -> ComparisonReport:
         if d:
             rep.node_prop_diffs.append(d)
 
-    def ekey(e: Edge) -> str:
-        return f"{e.start}|{e.kind}|{e.end}"
-
-    b_edges = {ekey(e): e for e in baseline.edges}
-    c_edges = {ekey(e): e for e in candidate.edges}
-    rep.edges_only_in_baseline = sorted(set(b_edges) - set(c_edges))
-    rep.edges_only_in_candidate = sorted(set(c_edges) - set(b_edges))
-    for k in sorted(set(b_edges) & set(c_edges)):
-        eb, ec = b_edges[k], c_edges[k]
-        d = _diff_props(k, eb.kind, eb.properties, ec.properties)
-        if d:
-            rep.edge_prop_diffs.append(d)
+    # A dictionary containing one edge per endpoint triple silently lost
+    # additional login mappings. Keep every record, cancel unchanged pairs, then
+    # compare the remaining records in a deterministic order.
+    b_edges: dict[str, list[Edge]] = {}
+    c_edges: dict[str, list[Edge]] = {}
+    for edge in baseline.edges:
+        b_edges.setdefault(edge_key(edge), []).append(edge)
+    for edge in candidate.edges:
+        c_edges.setdefault(edge_key(edge), []).append(edge)
+    for key in sorted(set(b_edges) | set(c_edges)):
+        before = sorted(b_edges.get(key, []), key=lambda edge: _canon(edge.properties))
+        after = sorted(c_edges.get(key, []), key=lambda edge: _canon(edge.properties))
+        remaining = []
+        for edge in before:
+            match = next((index for index, other in enumerate(after) if not _diff_props(key, edge.kind, edge.properties, other.properties)), None)
+            if match is None:
+                remaining.append(edge)
+            else:
+                # One occurrence cancels one occurrence, preserving multiplicity.
+                after.pop(match)
+        paired = min(len(remaining), len(after))
+        for index in range(paired):
+            difference = _diff_props(key, remaining[index].kind, remaining[index].properties, after[index].properties)
+            if difference:
+                rep.edge_prop_diffs.append(difference)
+        rep.edges_only_in_baseline.extend([key] * (len(remaining) - paired))
+        rep.edges_only_in_candidate.extend([key] * (len(after) - paired))
 
     rep.node_kind_rollup = _kind_rollup(baseline.nodes, candidate.nodes, lambda n: n.kinds)
     rep.edge_kind_rollup = _kind_rollup(baseline.edges, candidate.edges, lambda e: [e.kind])

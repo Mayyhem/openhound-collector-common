@@ -1,0 +1,113 @@
+{
+  "created": 1792751696.789,
+  "license": "Apache-2.0",
+  "samples": [
+    {
+      "level": "DEBUG",
+      "message": "Diagnostic detail",
+      "target": "lab-a",
+      "fields": [
+        {
+          "key": "count",
+          "value": 0
+        },
+        {
+          "key": "enabled",
+          "value": false
+        }
+      ],
+      "plain": "DEBUG   2026-10-23T10:34:56Z [lab-a] Diagnostic detail count=0 enabled=false\n",
+      "color": "\u001b[35mDEBUG  \u001b[0m 2026-10-23T10:34:56Z \u001b[38;5;150m[lab-a]\u001b[0m Diagnostic detail \u001b[2mcount=\u001b[0m0 \u001b[2menabled=\u001b[0mfalse\n"
+    },
+    {
+      "level": "VERBOSE",
+      "message": "Worker processing server",
+      "target": "lab-a",
+      "fields": [
+        {
+          "key": "worker",
+          "value": 2
+        },
+        {
+          "key": "ratio",
+          "value": 1.5
+        }
+      ],
+      "plain": "VERBOSE 2026-10-23T10:34:56Z [lab-a] Worker processing server worker=2 ratio=1.5\n",
+      "color": "\u001b[90mVERBOSE\u001b[0m 2026-10-23T10:34:56Z \u001b[38;5;150m[lab-a]\u001b[0m Worker processing server \u001b[2mworker=\u001b[0m2 \u001b[2mratio=\u001b[0m1.5\n"
+    },
+    {
+      "level": "INFO",
+      "message": "Starting collection",
+      "target": "",
+      "fields": [
+        {
+          "key": "targets",
+          "value": 2
+        },
+        {
+          "key": "version",
+          "value": "OpenHound test"
+        }
+      ],
+      "plain": "INFO    2026-10-23T10:34:56Z Starting collection targets=2 version=OpenHound test\n",
+      "color": "INFO   \u001b[0m 2026-10-23T10:34:56Z Starting collection \u001b[2mtargets=\u001b[0m2 \u001b[2mversion=\u001b[0mOpenHound test\n"
+    },
+    {
+      "level": "WARNING",
+      "message": "Optional read unavailable",
+      "target": "lab-b",
+      "fields": [
+        {
+          "key": "error",
+          "value": "permission denied"
+        }
+      ],
+      "plain": "WARNING 2026-10-23T10:34:56Z [lab-b] Optional read unavailable error=permission denied\n",
+      "color": "\u001b[33mWARNING\u001b[0m 2026-10-23T10:34:56Z \u001b[38;5;27m[lab-b]\u001b[0m Optional read unavailable \u001b[2merror=\u001b[0mpermission denied\n"
+    },
+    {
+      "level": "ERROR",
+      "message": "Connection failed",
+      "target": "lab-b",
+      "fields": [
+        {
+          "key": "retry",
+          "value": false
+        },
+        {
+          "key": "empty",
+          "value": ""
+        }
+      ],
+      "plain": "ERROR   2026-10-23T10:34:56Z [lab-b] Connection failed retry=false empty=\n",
+      "color": "\u001b[31mERROR  \u001b[0m 2026-10-23T10:34:56Z \u001b[38;5;27m[lab-b]\u001b[0m Connection failed \u001b[2mretry=\u001b[0mfalse \u001b[2mempty=\u001b[0m\n"
+    },
+    {
+      "level": "INFO",
+      "message": "Values",
+      "target": "lab-c",
+      "fields": [
+        {
+          "key": "names",
+          "value": [
+            "one",
+            "two"
+          ]
+        },
+        {
+          "key": "missing",
+          "value": null
+        },
+        {
+          "key": "empty",
+          "value": []
+        }
+      ],
+      "plain": "INFO    2026-10-23T10:34:56Z [lab-c] Values names=[one two] missing=\u003cnil\u003e empty=[]\n",
+      "color": "INFO   \u001b[0m 2026-10-23T10:34:56Z \u001b[38;5;33m[lab-c]\u001b[0m Values \u001b[2mnames=\u001b[0m[one two] \u001b[2mmissing=\u001b[0m\u003cnil\u003e \u001b[2mempty=\u001b[0m[]\n"
+    }
+  ],
+  "source_commit": "92efaeb892cd3e43dbdd5b4308dbf55383db1453",
+  "source_file": "internal/logging/handler.go"
+}

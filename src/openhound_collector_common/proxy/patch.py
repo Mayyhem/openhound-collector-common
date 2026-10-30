@@ -28,11 +28,14 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import errno
+import math
 import socket as _socket
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
-from .socks import ProxyConfig, socks5_handshake
+from .socks import ProxyConfig, SocksError, socks5_handshake
+from ..clients.deadline import Deadline
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,8 @@ _ORIG_CREATE_CONNECTION = _socket.create_connection
 _ORIG_GETADDRINFO = _socket.getaddrinfo
 
 _ACTIVE: Optional[ProxyConfig] = None
+_DEFAULT_CONNECT_TIMEOUT = 15.0
+_CONNECT_TIMEOUT = _DEFAULT_CONNECT_TIMEOUT
 
 
 def active_proxy() -> Optional[ProxyConfig]:
@@ -59,11 +64,11 @@ def _is_local(host: str) -> bool:
         return host == "localhost"
 
 
-def _bypass(host: str) -> bool:
+def _bypass(host: str, port=None) -> bool:
     """True if a connection to *host* must NOT be proxied."""
     if _ACTIVE is None:
         return True  # no proxy installed — never intercept
-    if host == _ACTIVE.host:
+    if host == _ACTIVE.host and (port is None or port == _ACTIVE.port):
         return True  # the proxy's own endpoint (recursion guard)
     if _is_local(host):
         logger.debug("_bypass: %s is local; connecting direct", host)
@@ -77,15 +82,47 @@ class _ProxiedSocket(_ORIG_SOCKET):  # type: ignore[misc,valid-type]
     def connect(self, address):  # noqa: D401 - stdlib override
         host = address[0]
         port = address[1]
-        if _bypass(host):
+        if _bypass(host, port):
             return super().connect(address)
         proxy = _ACTIVE
         # Connect to the proxy with the *real* connect (super), then hand the
         # destination NAME to the proxy so it resolves (socks5h).
         logger.debug("_ProxiedSocket.connect: tunneling to %s:%s via %s:%s",
                      host, port, proxy.host, proxy.port)
-        super().connect((proxy.host, proxy.port))
-        socks5_handshake(self, proxy, host, port)
+        original_timeout = self.gettimeout()
+        timeout = min(original_timeout, _CONNECT_TIMEOUT) if original_timeout else _CONNECT_TIMEOUT
+        self.settimeout(timeout)
+        try:
+            # One elapsed-time budget also stops a peer that keeps supplying a
+            # few bytes before each individual receive timeout would expire.
+            with Deadline.after(timeout).bound_socket(self):
+                super().connect((proxy.host, proxy.port))
+                socks5_handshake(self, proxy, host, port)
+        finally:
+            if self.fileno() != -1:
+                self.settimeout(original_timeout)
+            # An expired deadline already closed its socket; there is no mode
+            # left to restore, and the caller must discard that connection.
+
+    def connect_ex(self, address):
+        """Use the same SOCKS handshake for clients such as dnspython.
+
+        The handshake waits up to the configured limit even when the caller
+        selected immediate-return socket mode. Its original mode is restored
+        before returning. Failure is an error number, never a direct retry.
+        """
+        if _bypass(address[0], address[1]):
+            # Local listeners and the proxy endpoint keep ordinary socket behavior.
+            return super().connect_ex(address)
+        try:
+            self.connect(address)
+        except TimeoutError as error:
+            logger.warning("SOCKS connection deadline expired: %s", error)
+            return errno.ETIMEDOUT
+        except (OSError, SocksError) as error:
+            logger.warning("SOCKS connection failed: %s", error)
+            return getattr(error, "errno", None) or errno.ECONNREFUSED
+        return 0
 
 
 def create_connection(address, timeout=_socket._GLOBAL_DEFAULT_TIMEOUT,
@@ -96,7 +133,7 @@ def create_connection(address, timeout=_socket._GLOBAL_DEFAULT_TIMEOUT,
     (no local getaddrinfo). For bypassed targets we defer to the original.
     """
     host = address[0]
-    if _bypass(host):
+    if _bypass(host, address[1]):
         return _ORIG_CREATE_CONNECTION(address, timeout, source_address)
     sock = _ProxiedSocket(_socket.AF_INET, _socket.SOCK_STREAM)
     try:
@@ -118,21 +155,25 @@ def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     the name to ``connect`` for socks5h resolution. Loopback/bypassed hosts are
     resolved for real so local traffic is unaffected.
     """
-    if _bypass(host):
+    if _bypass(host, port):
         return _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
     logger.debug("getaddrinfo: deferring resolution of %s to the proxy", host)
     st = type or _socket.SOCK_STREAM
     return [(_socket.AF_INET, st, proto, "", (host, port or 0))]
 
 
-def install(proxy: ProxyConfig) -> None:
+def install(proxy: ProxyConfig, *, connect_timeout: float = _DEFAULT_CONNECT_TIMEOUT) -> None:
     """Install the process-wide interception for *proxy*."""
-    global _ACTIVE
+    global _ACTIVE, _CONNECT_TIMEOUT
+    if not math.isfinite(connect_timeout) or connect_timeout <= 0:
+        logger.error("SOCKS connection timeout must be finite and positive")
+        raise ValueError("SOCKS connection timeout must be finite and positive")
     if _ACTIVE is not None:
         # Not reentrant — a second install would stack wrappers. Fail loud.
         logger.error("install: a proxy (%s:%s) is already active", _ACTIVE.host, _ACTIVE.port)
         raise RuntimeError("SOCKS proxy already installed; uninstall first")
     _ACTIVE = proxy
+    _CONNECT_TIMEOUT = connect_timeout
     # Replacing names in the stdlib socket module IS the mechanism here: every library in
     # the process (ldap3, requests, impacket) resolves socket.socket at call time, so
     # rebinding it is what makes their traffic tunnel without any of them cooperating.
@@ -146,17 +187,18 @@ def install(proxy: ProxyConfig) -> None:
 
 def uninstall() -> None:
     """Restore the original socket functions."""
-    global _ACTIVE
+    global _ACTIVE, _CONNECT_TIMEOUT
     _socket.socket = _ORIG_SOCKET  # type: ignore[misc]  # see install(): rebinding a type
     _socket.create_connection = _ORIG_CREATE_CONNECTION
     _socket.getaddrinfo = _ORIG_GETADDRINFO
     if _ACTIVE is not None:
         logger.info("SOCKS5 proxy uninstalled (was %s:%s)", _ACTIVE.host, _ACTIVE.port)
     _ACTIVE = None
+    _CONNECT_TIMEOUT = _DEFAULT_CONNECT_TIMEOUT
 
 
 @contextmanager
-def socks_proxy_installed(proxy: Optional[ProxyConfig]) -> Iterator[None]:
+def socks_proxy_installed(proxy: Optional[ProxyConfig], *, connect_timeout: float = _DEFAULT_CONNECT_TIMEOUT) -> Iterator[None]:
     """Install *proxy* for the duration of the block, then restore.
 
     A falsey *proxy* is a pass-through no-op, so callers can wrap a run
@@ -166,7 +208,7 @@ def socks_proxy_installed(proxy: Optional[ProxyConfig]) -> Iterator[None]:
         logger.debug("socks_proxy_installed: no proxy; running direct")
         yield
         return
-    install(proxy)
+    install(proxy, connect_timeout=connect_timeout)
     try:
         yield
     finally:

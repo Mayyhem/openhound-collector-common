@@ -34,7 +34,7 @@ Authentication is one of (selected by which constructor arg is set):
   * **NTLM** with explicit ``user`` + ``password``.
   * **NTLM pass-the-hash** with ``user`` + ``nt_hash`` (LM:NT or bare NT hex).
   * **Kerberos pass-the-ticket** from a base64 KRB-CRED (``.kirbi``) — loaded
-    into a private in-memory ccache that ldap3's SASL GSSAPI backend then uses.
+    into run-local ticket material used directly on this ldap3 connection.
   * **Current-user SSPI** (Windows only) — the logged-on user's session, no
     explicit credentials. Gated behind ``sys.platform == "win32"``.
 
@@ -50,17 +50,17 @@ advance ``badPwdCount``.
 
 from __future__ import annotations
 
-import atexit
-import base64
 import importlib
 import ipaddress
-import os
 import socket
 import struct
 import sys
-import tempfile
+import time
+from collections.abc import Callable, Generator
+from contextlib import closing
+from threading import Lock
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal, Optional
 
 from ldap3 import (
@@ -75,7 +75,7 @@ from ldap3 import (
     Connection,
     Server,
 )
-from ldap3.core.exceptions import LDAPBindError, LDAPException
+from ldap3.core.exceptions import LDAPBindError, LDAPCommunicationError, LDAPException
 from ldap3.core.results import RESULT_SUCCESS
 from ldap3.utils.conv import escape_filter_chars
 
@@ -83,6 +83,22 @@ from ldap3.utils.conv import escape_filter_chars
 # ``Logger.verbose`` method we use below (per-search trace). Imported for that
 # side effect; ``noqa`` because the name itself is unused here.
 from ..logging.log_context import get_logger
+from ..collection import OperationResult
+from ..discovery.dns import dc_hostname_for_address
+from ..discovery.network import active_resolver
+from .auth import split_user_domain
+from .operations import ClientCleanupError, ReadControl, ReadOperation, ReadStoppedError
+from .identity_errors import is_windows_credential_rejection
+from .windows_ldap import WindowsLdapClient, WindowsLdapError
+from ..proxy import active_proxy
+from .kerberos import (
+    CredentialInputError,
+    KerberosAcquisitionError,
+    KerberosCredentials,
+    load_kerberos_credentials,
+    validate_kerberos_identity,
+    validate_secret_sources,
+)
 
 # ENCRYPT / TLS_CHANNEL_BINDING were added in ldap3 2.10.2rc4 (our floor). Newer
 # DCs that enforce LDAP signing or channel binding need these constants. Try-
@@ -158,7 +174,12 @@ def _is_credential_failure(exc: BaseException) -> bool:
     disabled). Returning True stops the waterfall — retrying another transport
     would only advance badPwdCount without changing the outcome."""
     text = _bind_error_text(exc)
-    if "invalidcredentials" not in text:
+    # Providers write this label as either invalidCredentials or Invalid
+    # Credentials. Spacing must not turn the same rejected password into a retry.
+    compact_text = "".join(text.split())
+    if "invalidcredentials" not in compact_text:
+        # The bind caller logs the resulting failure or retry. Classification
+        # itself neither opens a connection nor hides a failed operation.
         return False
     return any(f"data {code}" in text for code in _CREDENTIAL_FAILURE_SUBCODES)
 
@@ -217,10 +238,12 @@ def bytes_to_sid(value: Any) -> Optional[str]:
     sub_authority_count = value[1]
     identifier_authority = int.from_bytes(value[2:8], "big")
     sub_authorities = [
-        struct.unpack("<I", value[8 + i * 4: 8 + i * 4 + 4])[0]
+        struct.unpack("<I", value[8 + i * 4 : 8 + i * 4 + 4])[0]
         for i in range(sub_authority_count)
     ]
-    parts = [str(revision), str(identifier_authority)] + [str(sa) for sa in sub_authorities]
+    parts = [str(revision), str(identifier_authority)] + [
+        str(sa) for sa in sub_authorities
+    ]
     return "S-" + "-".join(parts)
 
 
@@ -325,14 +348,46 @@ class LdapAuth:
 
     * ``username`` + ``password`` → NTLM bind.
     * ``username`` + ``nt_hash`` (``LM:NT`` or bare 32-hex NT) → NTLM PtH bind.
-    * ``kerberos_ticket`` (base64 KRB-CRED) → GSSAPI bind via a private ccache.
+    * ``kerberos_ticket`` (base64 KRB-CRED) → connection-local Kerberos bind.
     * none of the above → current-user SSPI (Windows) or anonymous.
     """
 
     username: Optional[str] = None
-    password: Optional[str] = None
-    nt_hash: Optional[str] = None
-    kerberos_ticket: Optional[str] = None  # base64 KRB-CRED (.kirbi)
+    password: Optional[str] = field(default=None, repr=False)
+    nt_hash: Optional[str] = field(default=None, repr=False)
+    kerberos_ticket: Optional[str] = field(default=None, repr=False)
+    kerberos_ccache: str | None = field(default=None, repr=False)
+    kerberos_keytab: str | None = field(default=None, repr=False)
+    kerberos_realm: str | None = None
+    kerberos_credentials: KerberosCredentials | None = field(default=None, repr=False)
+    kdc_host: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_secret_sources(
+            password=self.password,
+            nt_hash=self.nt_hash,
+            ticket=self.kerberos_ticket,
+            ccache=self.kerberos_ccache,
+            keytab=self.kerberos_keytab,
+            loaded_credentials=self.kerberos_credentials,
+        )
+        if self.kerberos_credentials is not None:
+            validate_kerberos_identity(
+                self.kerberos_credentials, self.username, self.kerberos_realm
+            )
+
+    def uses_explicit_kerberos(self) -> bool:
+        """Whether a supplied credential source/realm replaces ambient OS Kerberos."""
+        return any(
+            value is not None
+            for value in (
+                self.kerberos_ticket,
+                self.kerberos_ccache,
+                self.kerberos_keytab,
+                self.kerberos_credentials,
+                self.kerberos_realm,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -344,8 +399,8 @@ class _BindAttempt:
     port: int
     start_tls: bool
     session_security: bool  # NTLM sign+seal — requires NTLM credentials
-    channel_binding: bool   # TLS CBT — requires TLS + NTLM credentials
-    auth_mode: str          # "ntlm" | "ntlm_hash" | "kerberos" | "sspi_ntlm" | "anonymous"
+    channel_binding: bool  # TLS CBT — requires TLS + NTLM credentials
+    auth_mode: str  # "ntlm" | "ntlm_hash" | "kerberos" | "sspi_ntlm" | "anonymous"
 
 
 class AdClient:
@@ -363,20 +418,71 @@ class AdClient:
         auth: Optional[LdapAuth] = None,
         *,
         port: Optional[int] = None,
+        on_query: Callable[[OperationResult], None] | None = None,
+        native_fallback: ReadControl | None = None,
+        read_control: ReadControl | None = None,
     ) -> None:
         self.domain = domain
         self.dc = dc
         self.auth = auth or LdapAuth()
         self.port = port
-        self.base_dn = ",".join(f"DC={part}" for part in domain.split(".")) if domain else ""
+        self.on_query = on_query
+        self.last_query_result: OperationResult | None = None
+        self.native_fallback = native_fallback
+        self.read_control = read_control
+        if read_control is not None and not isinstance(read_control, ReadControl):
+            logger.error("LDAP read limits require validated read controls")
+            raise ValueError("LDAP read limits require ReadControl")
+        self._opening_conn: Connection | None = None
+        self._bind_operation: ReadOperation | None = None
+        self._search_operation: ReadOperation | None = None
+        self._search_guard = Lock()
+        if native_fallback is not None and not isinstance(native_fallback, ReadControl):
+            logger.error("Native LDAP fallback requires validated read controls")
+            raise ValueError("Native LDAP fallback requires ReadControl")
+        self.selected_backend = "ldap3"
+        self._credential_failure: Exception | None = None
+        self.base_dn = (
+            ",".join(f"DC={part}" for part in domain.split(".")) if domain else ""
+        )
         self._conn: Optional[Connection] = None
-        self._ccache_path: Optional[str] = None  # temp ccache for PtT, if used
+        self._kerberos_credentials = self.auth.kerberos_credentials
         self._sid_cache: dict[str, Optional[dict[str, Any]]] = {}
         self._name_cache: dict[str, Optional[dict[str, Any]]] = {}
 
     # ------------------------------------------------------------------ bind --
 
     def bind(self) -> Connection:
+        """Bind with the optional whole-attempt budget, preserving default policy."""
+        if self.read_control is None:
+            return self._bind()  # Existing consumers keep their timeout behavior.
+        operation = None
+        try:
+            operation = self.read_control.operation("LDAP bind", self._interrupt)
+            with operation:
+                self._bind_operation = operation
+                return self._bind()
+        except BaseException as error:
+            if isinstance(error, ReadStoppedError) or (
+                operation is not None and operation.is_stopped
+            ):
+                logger.warning(
+                    "LDAP bind stopped; refusing further authentication attempts"
+                )
+                self.close()
+                if isinstance(error, ClientCleanupError):
+                    raise  # Failed cleanup must remain a fatal run failure.
+                raise ReadStoppedError("LDAP bind was stopped") from error
+            raise
+        finally:
+            self._bind_operation = None
+
+    def _bind(self) -> Connection:
+        if self._credential_failure is not None:
+            logger.warning(
+                "LDAP credentials were already rejected; refusing another submission"
+            )
+            raise self._credential_failure
         if self._conn is not None and self._conn.bound:
             return self._conn
 
@@ -387,34 +493,70 @@ class AdClient:
         last_exc: Optional[BaseException] = None
         for attempt in attempts:
             try:
-                self._conn = self._open_connection(host=host, attempt=attempt)
+                self._conn = self._open_attempt(host=host, attempt=attempt)
                 logger.info(
                     "LDAP connected: %s:%d (auth=%s, profile=%s)",
-                    host, attempt.port, attempt.auth_mode, attempt.label,
+                    host,
+                    attempt.port,
+                    attempt.auth_mode,
+                    attempt.label,
                 )
                 return self._conn
+            except (ClientCleanupError, ReadStoppedError):
+                logger.error(
+                    "LDAP binding stopped or cleanup failed; no other profile will be tried"
+                )
+                raise
+            except (CredentialInputError, KerberosAcquisitionError) as error:
+                self._credential_failure = error
+                logger.error(
+                    "LDAP cannot use the selected explicit Kerberos identity; stopping attempts"
+                )
+                raise
             except LDAPException as exc:
-                if _is_credential_failure(exc):
+                if _is_credential_failure(exc) or is_windows_credential_rejection(exc):
+                    self._credential_failure = exc
                     # Bad/locked/expired credential — stop now to avoid lockout.
-                    logger.error("LDAP bind via %s failed with a credential error: %s", attempt.label, exc)
+                    logger.error(
+                        "LDAP bind via %s failed with a credential error: %s",
+                        attempt.label,
+                        exc,
+                    )
                     raise
                 last_exc = exc
-                logger.debug("LDAP bind via %s failed (%s); trying next profile", attempt.label, exc)
+                logger.debug(
+                    "LDAP bind via %s failed (%s); trying next profile",
+                    attempt.label,
+                    exc,
+                )
                 continue
             except OSError as exc:
                 # Connect/TLS failure — no auth attempted, safe to fall through.
                 last_exc = exc
                 logger.debug(
                     "LDAP transport to %s:%d (%s) failed: %s; trying next profile",
-                    host, attempt.port, attempt.label, exc,
+                    host,
+                    attempt.port,
+                    attempt.label,
+                    exc,
                 )
                 continue
             except Exception as exc:
+                if is_windows_credential_rejection(exc):
+                    self._credential_failure = exc
+                    logger.error(
+                        "Windows rejected the LDAP identity; stopping authentication attempts"
+                    )
+                    raise
                 if attempt.auth_mode in ("kerberos", "sspi_ntlm"):
                     # Integrated-auth backends raise non-LDAP exceptions (SSPI /
                     # GSSAPI errors); treat as a soft failure and keep going.
                     last_exc = exc
-                    logger.debug("LDAP bind via %s failed (%s); trying next profile", attempt.label, exc)
+                    logger.debug(
+                        "LDAP bind via %s failed (%s); trying next profile",
+                        attempt.label,
+                        exc,
+                    )
                     continue
                 # Unexpected failure on an explicit-cred path — surface it.
                 raise
@@ -423,15 +565,77 @@ class AdClient:
             raise last_exc
         raise RuntimeError("LDAP connection failed before any bind was attempted")
 
+    def _interrupt(self) -> None:
+        """Shut down only this client's current or opening Python LDAP socket."""
+        for connection in (self._conn, self._opening_conn):
+            owned_socket = getattr(connection, "socket", None)
+            if owned_socket is None:
+                continue  # Socket creation may still be in progress.
+            try:
+                owned_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                logger.debug("LDAP cancellation found an already stopped socket")
+            finally:
+                # On Windows, shutdown alone does not wake Python's select wait
+                # for a socket with a receive timeout. This connection owns the
+                # socket; close it too, then let the reading thread release the
+                # LDAP connection object. Native WLDAP handles are not closed here.
+                owned_socket.close()
+
+    def _release_connection(self, connection: Connection) -> None:
+        """Release on the calling thread; monitored consumers require confirmed cleanup."""
+        try:
+            connection.unbind()
+        except Exception as error:
+            operation = self._search_operation or self._bind_operation
+            owned_socket = getattr(connection, "socket", None)
+            if (
+                isinstance(error, LDAPCommunicationError)
+                and operation is not None
+                and operation.is_stopped
+                and owned_socket is not None
+                and owned_socket.fileno() == -1
+            ):
+                logger.debug(
+                    "Stopped LDAP socket is confirmed closed; no unbind message can be sent"
+                )
+                return
+            if self.read_control is not None:
+                logger.error("LDAP connection cleanup failed; the owning run must fail")
+                raise ClientCleanupError("LDAP connection cleanup failed") from error
+            logger.debug("LDAP connection cleanup failed (%s)", type(error).__name__)
+
     def close(self) -> None:
         if self._conn is not None:
             try:
-                self._conn.unbind()
-            except Exception:
-                # Unbind on an already-dead socket is noise; ignore.
-                pass
-            self._conn = None
-        self._cleanup_ccache()
+                self._release_connection(self._conn)
+            finally:
+                self._conn = None
+
+    def _open_attempt(self, *, host: str, attempt: _BindAttempt) -> Connection:
+        """Keep an opening connection reachable until its owning thread releases it."""
+        connection = None
+        try:
+            if self._bind_operation is not None:
+                self._bind_operation.check()
+            connection = self._open_connection(host=host, attempt=attempt)
+            if self._bind_operation is not None:
+                self._bind_operation.check()
+            return connection
+        except BaseException as error:
+            opening = (
+                self._opening_conn if self._opening_conn is not None else connection
+            )
+            if self.read_control is not None and opening is not None:
+                self._release_connection(opening)
+            # Non-monitored constructors retain their existing cleanup policy.
+            if isinstance(error, ClientCleanupError):
+                raise  # Never replace a failed cleanup with an ordinary stop.
+            if self._bind_operation is not None and self._bind_operation.is_stopped:
+                raise ReadStoppedError("LDAP bind was stopped") from error
+            raise
+        finally:
+            self._opening_conn = None
 
     # ------------------------------------------------------------- planning --
 
@@ -442,7 +646,7 @@ class AdClient:
         return bool(self.auth.username and self.auth.nt_hash)
 
     def _has_ticket(self) -> bool:
-        return bool(self.auth.kerberos_ticket)
+        return self.auth.uses_explicit_kerberos()
 
     def _select_auth_modes(self) -> list[str]:
         """Pick the ordered bind modes from the supplied credential."""
@@ -487,32 +691,55 @@ class AdClient:
             return mode in ("ntlm", "ntlm_hash", "kerberos")
 
         def ntlm_like(mode: str) -> bool:
-            return mode in ("ntlm", "ntlm_hash", "sspi_ntlm")
+            # Explicit Kerberos also supplies connection-local sign/seal now.
+            return mode in ("ntlm", "ntlm_hash", "sspi_ntlm") or (
+                mode == "kerberos" and self.auth.uses_explicit_kerberos()
+            )
 
         def ldaps(mode: str, port: int) -> _BindAttempt:
             cbt = cbt_capable(mode)
             return _BindAttempt(
-                label=f"LDAPS{'+CBT' if cbt else ''}", use_ssl=True, port=port,
-                start_tls=False, session_security=False, channel_binding=cbt, auth_mode=mode,
+                label=f"LDAPS{'+CBT' if cbt else ''}",
+                use_ssl=True,
+                port=port,
+                start_tls=False,
+                session_security=False,
+                channel_binding=cbt,
+                auth_mode=mode,
             )
 
         def starttls(mode: str, port: int) -> _BindAttempt:
             cbt = cbt_capable(mode)
             return _BindAttempt(
-                label=f"StartTLS{'+CBT' if cbt else ''}", use_ssl=False, port=port,
-                start_tls=True, session_security=False, channel_binding=cbt, auth_mode=mode,
+                label=f"StartTLS{'+CBT' if cbt else ''}",
+                use_ssl=False,
+                port=port,
+                start_tls=True,
+                session_security=False,
+                channel_binding=cbt,
+                auth_mode=mode,
             )
 
         def ldap_signed(mode: str, port: int) -> _BindAttempt:
             return _BindAttempt(
-                label="LDAP+sign/seal", use_ssl=False, port=port,
-                start_tls=False, session_security=True, channel_binding=False, auth_mode=mode,
+                label="LDAP+sign/seal",
+                use_ssl=False,
+                port=port,
+                start_tls=False,
+                session_security=True,
+                channel_binding=False,
+                auth_mode=mode,
             )
 
         def ldap_plain(mode: str, port: int) -> _BindAttempt:
             return _BindAttempt(
-                label="LDAP", use_ssl=False, port=port,
-                start_tls=False, session_security=False, channel_binding=False, auth_mode=mode,
+                label="LDAP",
+                use_ssl=False,
+                port=port,
+                start_tls=False,
+                session_security=False,
+                channel_binding=False,
+                auth_mode=mode,
             )
 
         attempts: list[_BindAttempt] = []
@@ -560,11 +787,23 @@ class AdClient:
             return attempts, host
 
         rdns_hostname = _reverse_dns_hostname(self.dc)
+        resolver = active_resolver()
+        if (
+            rdns_hostname is None
+            and self.auth.uses_explicit_kerberos()
+            and resolver is not None
+        ):
+            # A run-selected DNS service can prove the same DC's name even when
+            # its reverse zone is absent. Do not guess or switch to another DC.
+            rdns_hostname = dc_hostname_for_address(
+                self.domain, str(self.dc), resolver=resolver
+            )
         if rdns_hostname:
             logger.info(
-                "LDAP auth: reverse DNS resolved Kerberos DC IP '%s' to '%s'; "
+                "LDAP auth: DNS resolved Kerberos DC IP '%s' to '%s'; "
                 "using that hostname to build the LDAP service principal name.",
-                self.dc, rdns_hostname,
+                self.dc,
+                rdns_hostname,
             )
             return attempts, rdns_hostname
 
@@ -604,7 +843,9 @@ class AdClient:
         elif "ntlm" in modes:
             logger.info("LDAP auth: NTLM as %s", self.auth.username)
         elif "kerberos" in modes and self._has_ticket():
-            logger.info("LDAP auth: Kerberos pass-the-ticket (base64 KRB-CRED)")
+            logger.info(
+                "LDAP auth: explicit Kerberos identity (ticket/cache/keytab or selected realm)"
+            )
         elif "kerberos" in modes:
             logger.info("LDAP auth: integrated Kerberos (current OS user TGT)")
         elif "sspi_ntlm" in modes:
@@ -614,10 +855,18 @@ class AdClient:
 
     def _open_connection(self, *, host: str, attempt: _BindAttempt) -> Connection:
         """Open and bind one Connection with the requested security settings."""
-        server = Server(host, port=attempt.port, use_ssl=attempt.use_ssl, get_info=ALL, connect_timeout=5)
+        server = Server(
+            host,
+            port=attempt.port,
+            use_ssl=attempt.use_ssl,
+            get_info=ALL,
+            connect_timeout=5,
+        )
 
         kwargs: dict[str, Any] = {
-            "auto_bind": AUTO_BIND_TLS_BEFORE_BIND if attempt.start_tls else AUTO_BIND_NO_TLS,
+            "auto_bind": AUTO_BIND_TLS_BEFORE_BIND
+            if attempt.start_tls
+            else AUTO_BIND_NO_TLS,
             "read_only": True,
             "receive_timeout": 30,
             # Never chase referrals: a subtree search at the domain root makes AD
@@ -628,19 +877,24 @@ class AdClient:
         }
 
         if attempt.auth_mode == "sspi_ntlm":
-            return self._open_current_user_ntlm_connection(server=server, attempt=attempt)
+            return self._open_current_user_ntlm_connection(
+                server=server, attempt=attempt
+            )
+        if attempt.auth_mode == "kerberos" and self.auth.uses_explicit_kerberos():
+            return self._open_explicit_kerberos_connection(
+                server=server, attempt=attempt
+            )
 
         if attempt.auth_mode in ("ntlm", "ntlm_hash"):
-            kwargs.update({
-                "user": self._ntlm_user(),
-                "password": self._ntlm_secret(attempt.auth_mode),
-                "authentication": NTLM,
-            })
+            kwargs.update(
+                {
+                    "user": self._ntlm_user(),
+                    "password": self._ntlm_secret(attempt.auth_mode),
+                    "authentication": NTLM,
+                }
+            )
         elif attempt.auth_mode == "kerberos":
-            # GSSAPI reads the principal from the OS cred cache. For pass-the-
-            # ticket we point KRB5CCNAME at a private ccache built from the
-            # base64 KRB-CRED before the bind (see _ensure_ticket_ccache).
-            self._ensure_ticket_ccache()
+            # Only the ambient/current-user path reaches the OS GSSAPI provider.
             kwargs.update({"authentication": SASL, "sasl_mechanism": KERBEROS})
         # "anonymous" → leave authentication unset (ldap3 default ANONYMOUS).
 
@@ -650,7 +904,23 @@ class AdClient:
             kwargs["channel_binding"] = TLS_CHANNEL_BINDING
 
         try:
-            return Connection(server, **kwargs)
+            if self.read_control is None:
+                return Connection(server, **kwargs)
+            # Construct without network work so cancellation can reach the
+            # socket during open, TLS, authentication and schema reads. ldap3's
+            # documented manual open/start_tls/bind sequence preserves policy.
+            kwargs["auto_bind"] = AUTO_BIND_NONE
+            connection = Connection(server, **kwargs)
+            self._opening_conn = connection
+            connection.open(read_server_info=False)
+            if attempt.start_tls and not connection.start_tls(read_server_info=False):
+                logger.warning("StartTLS before monitored LDAP bind failed")
+                raise LDAPBindError("StartTLS before monitored LDAP bind failed")
+            if not connection.bind():
+                logger.warning("Monitored LDAP bind was rejected")
+                raise LDAPBindError(str(connection.result))
+            connection.refresh_server_info()
+            return connection
         except TypeError as exc:
             # Older ldap3 rejects session_security / channel_binding kwargs.
             if attempt.session_security or attempt.channel_binding:
@@ -658,6 +928,75 @@ class AdClient:
                     "LDAP signing / channel binding requires ldap3 >= 2.10.2rc4 "
                     "(session_security and channel_binding support)."
                 ) from exc
+            raise
+
+    def _open_explicit_kerberos_connection(
+        self, *, server: Server, attempt: _BindAttempt
+    ) -> Connection:
+        """Use supplied tickets/keys on this connection, including custom LDAP ports."""
+        from .ldap_kerberos import bind_explicit_kerberos
+
+        auth = self.auth
+        if self._kerberos_credentials is None and any(
+            value is not None
+            for value in (
+                auth.kerberos_ticket,
+                auth.kerberos_ccache,
+                auth.kerberos_keytab,
+            )
+        ):
+            self._kerberos_credentials = load_kerberos_credentials(
+                ticket=auth.kerberos_ticket,
+                ccache_file=auth.kerberos_ccache,
+                keytab_file=auth.kerberos_keytab,
+                username=auth.username,
+                realm=auth.kerberos_realm,
+            )
+        realm = (
+            self._kerberos_credentials.realm
+            if self._kerberos_credentials
+            else (auth.kerberos_realm or self.domain)
+        )
+        _, username = split_user_domain(auth.username or "", realm)
+        connection = Connection(
+            server,
+            auto_bind=AUTO_BIND_NONE,
+            authentication=SASL,
+            sasl_mechanism=KERBEROS,
+            read_only=True,
+            receive_timeout=30,
+            auto_referrals=False,
+        )
+        if self.read_control is not None:
+            self._opening_conn = connection
+        try:
+            connection.open(read_server_info=False)
+            if attempt.start_tls and not connection.start_tls(read_server_info=False):
+                logger.warning("StartTLS before explicit Kerberos bind failed")
+                raise LDAPBindError("StartTLS before Kerberos bind failed")
+            bind_explicit_kerberos(
+                connection,
+                host=str(server.host),
+                realm=realm,
+                username=username or None,
+                password=auth.password,
+                nt_hash=auth.nt_hash,
+                credentials=self._kerberos_credentials,
+                kdc_host=auth.kdc_host or self.dc,
+                use_tls=attempt.use_ssl or attempt.start_tls,
+            )
+            connection.refresh_server_info()
+            return connection
+        except BaseException:
+            if self.read_control is not None:
+                raise  # _open_attempt owns monitored failed-bind cleanup.
+            try:
+                connection.unbind()
+            except Exception as error:
+                logger.debug(
+                    "Failed LDAP bind connection cleanup failed (%s)",
+                    type(error).__name__,
+                )
             raise
 
     def _ntlm_user(self) -> str:
@@ -685,19 +1024,29 @@ class AdClient:
         # Bare NT hash — prepend an empty LM half so ldap3 treats it as PtH.
         return f"{'0' * 32}:{nt}"
 
-    def _open_current_user_ntlm_connection(self, *, server: Server, attempt: _BindAttempt) -> Connection:
+    def _open_current_user_ntlm_connection(
+        self, *, server: Server, attempt: _BindAttempt
+    ) -> Connection:
         conn = Connection(
-            server, auto_bind=AUTO_BIND_NONE, authentication=NTLM, read_only=True,
-            receive_timeout=30, auto_referrals=False,
+            server,
+            auto_bind=AUTO_BIND_NONE,
+            authentication=NTLM,
+            read_only=True,
+            receive_timeout=30,
+            auto_referrals=False,
             # session_security likewise postdates the 2.9.13 stubs (see the ENCRYPT import).
             session_security=ENCRYPT if attempt.session_security else None,  # type: ignore[call-arg]
         )
+        if self.read_control is not None:
+            self._opening_conn = conn
         conn.open(read_server_info=False)
         if attempt.start_tls and not conn.start_tls(read_server_info=False):
             error = "StartTLS before current-user NTLM bind failed"
             if conn.last_error:
                 error = f"{error}: {conn.last_error}"
-            conn.unbind()
+            if self.read_control is None:
+                conn.unbind()
+            # The monitored path releases the connection in _open_attempt.
             raise LDAPBindError(error)
         self._bind_current_user_ntlm(conn)
         conn.refresh_server_info()
@@ -725,88 +1074,213 @@ class AdClient:
                 ntlm_client: Any = _SSPICurrentUserNtlmClient()
                 conn.ntlm_client = ntlm_client  # type: ignore[attr-defined]
 
-                request = bind_operation(conn.version, "SICILY_PACKAGE_DISCOVERY", ntlm_client)
-                response = conn.post_send_single_response(conn.send("bindRequest", request, controls))
-                result = response[0] if conn.strategy.sync else conn.get_response(response)[1]
-                packages = (result.get("server_creds") or b"").decode("ascii", errors="ignore").split(";")
+                request = bind_operation(
+                    conn.version, "SICILY_PACKAGE_DISCOVERY", ntlm_client
+                )
+                response = conn.post_send_single_response(
+                    conn.send("bindRequest", request, controls)
+                )
+                result = (
+                    response[0]
+                    if conn.strategy.sync
+                    else conn.get_response(response)[1]
+                )
+                packages = (
+                    (result.get("server_creds") or b"")
+                    .decode("ascii", errors="ignore")
+                    .split(";")
+                )
                 if "NTLM" not in packages:
                     raise LDAPBindError("DC did not advertise the NTLM Sicily package")
 
-                request = bind_operation(conn.version, "SICILY_NEGOTIATE_NTLM", ntlm_client)
-                response = conn.post_send_single_response(conn.send("bindRequest", request, controls))
-                result = response[0] if conn.strategy.sync else conn.get_response(response)[1]
+                request = bind_operation(
+                    conn.version, "SICILY_NEGOTIATE_NTLM", ntlm_client
+                )
+                response = conn.post_send_single_response(
+                    conn.send("bindRequest", request, controls)
+                )
+                result = (
+                    response[0]
+                    if conn.strategy.sync
+                    else conn.get_response(response)[1]
+                )
 
                 if result and result.get("result") == RESULT_SUCCESS:
                     request = bind_operation(
-                        conn.version, "SICILY_RESPONSE_NTLM", ntlm_client, result.get("server_creds"),
+                        conn.version,
+                        "SICILY_RESPONSE_NTLM",
+                        ntlm_client,
+                        result.get("server_creds"),
                     )
-                    response = conn.post_send_single_response(conn.send("bindRequest", request, controls))
-                    result = response[0] if conn.strategy.sync else conn.get_response(response)[1]
+                    response = conn.post_send_single_response(
+                        conn.send("bindRequest", request, controls)
+                    )
+                    result = (
+                        response[0]
+                        if conn.strategy.sync
+                        else conn.get_response(response)[1]
+                    )
 
                 conn.result = result
                 conn.bound = bool(result and result.get("result") == RESULT_SUCCESS)
                 if not conn.bound:
                     description = result.get("description") if result else None
                     message = result.get("message") if result else None
-                    conn.last_error = description or message or "current-user NTLM bind failed"
+                    conn.last_error = (
+                        description or message or "current-user NTLM bind failed"
+                    )
                     raise LDAPBindError(conn.last_error)
             except LDAPException:
                 raise
             except Exception as ex:
-                raise LDAPBindError(f"current-user NTLM via Windows SSPI failed: {ex}") from ex
+                raise LDAPBindError(
+                    f"current-user NTLM via Windows SSPI failed: {ex}"
+                ) from ex
             finally:
                 conn.sasl_in_progress = False
 
-    # ----------------------------------------------------- ticket → ccache --
-
-    def _ensure_ticket_ccache(self) -> None:
-        """Load the base64 KRB-CRED into a private ccache and point KRB5CCNAME
-        at it so ldap3's SASL GSSAPI backend authenticates with that ticket.
-
-        Cross-platform pass-the-ticket: impacket parses the ``.kirbi`` blob,
-        writes a temp ccache, and the OS Kerberos backend (gssapi/winkerberos)
-        reads it via KRB5CCNAME. Cleaned up on close() and at interpreter exit.
-        """
-        if self._ccache_path is not None:
-            # Already materialized for this client — reuse it.
-            return
-        ticket = self.auth.kerberos_ticket
-        if not ticket:
-            # No ticket configured — nothing to do (shouldn't happen on this path).
-            return
-        try:
-            from impacket.krb5.ccache import CCache
-        except ImportError as exc:
-            raise RuntimeError("Kerberos pass-the-ticket requires impacket (CCache).") from exc
-        try:
-            ccache = CCache()
-            ccache.fromKRBCRED(base64.b64decode(ticket, validate=True))
-        except Exception as exc:
-            raise ValueError(f"--ldap-ticket is not a valid base64 KRB-CRED (.kirbi): {exc}") from exc
-
-        fd, path = tempfile.mkstemp(prefix="oh_ldap_", suffix=".ccache")
-        os.close(fd)
-        ccache.saveFile(path)
-        os.environ["KRB5CCNAME"] = path
-        self._ccache_path = path
-        # Ensure the temp ccache is removed even if close() isn't called.
-        atexit.register(self._cleanup_ccache)
-        logger.debug("Loaded pass-the-ticket KRB-CRED into ccache %s", path)
-
-    def _cleanup_ccache(self) -> None:
-        if self._ccache_path is None:
-            return
-        try:
-            os.unlink(self._ccache_path)
-        except OSError as exc:
-            # Best-effort cleanup; a leftover temp ccache is harmless.
-            logger.debug("Could not remove temp ccache %s: %s", self._ccache_path, exc)
-        finally:
-            self._ccache_path = None
-
     # ---------------------------------------------------------- paged search --
 
+    def _can_use_native_fallback(self, error: BaseException) -> bool:
+        """Never change identities, retry rejected credentials or repeat partial data."""
+        if self.native_fallback is None:
+            return False  # Existing consumers do not select this fallback.
+        if isinstance(error, (ReadStoppedError, ClientCleanupError)):
+            logger.warning(
+                "Skipping native LDAP fallback after a stop or cleanup failure"
+            )
+            return False
+        if sys.platform != "win32" or active_proxy() is not None:
+            logger.debug(
+                "Skipping native LDAP fallback: it requires direct Windows networking"
+            )
+            return False
+        if any(
+            value is not None
+            for value in (
+                self.auth.username,
+                self.auth.password,
+                self.auth.nt_hash,
+                self.auth.kerberos_ticket,
+                self.auth.kerberos_ccache,
+                self.auth.kerberos_keytab,
+                self.auth.kerberos_realm,
+                self.auth.kerberos_credentials,
+            )
+        ):
+            logger.debug(
+                "Skipping native LDAP fallback: an explicit identity was selected"
+            )
+            return False
+        code = getattr(error, "hresult", None)
+        rejected = (
+            self._credential_failure is not None
+            or _is_credential_failure(error)
+            or "invalidcredentials" in _bind_error_text(error)
+            or is_windows_credential_rejection(error)
+        )
+        if rejected:
+            logger.warning("Skipping native LDAP fallback after credential rejection")
+            return False
+        eligible = isinstance(
+            error, (OSError, LDAPCommunicationError, LDAPBindError, ImportError)
+        ) or isinstance(code, int)
+        if not eligible:
+            logger.debug(
+                "Skipping native LDAP fallback for a non-transport/non-authentication error"
+            )
+        return eligible
+
+    def _native_entries(
+        self,
+        search_filter: str,
+        attributes: list[str],
+        base: str,
+        scope: Literal["BASE", "LEVEL", "SUBTREE"],
+        size_limit: int,
+        paged_size: int,
+        controls: list[str] | None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Preserve the existing attribute converter and keep native cleanup local."""
+        if controls:
+            logger.warning(
+                "Native Windows LDAP does not support these additional search controls"
+            )
+            raise LDAPException(
+                "Native Windows LDAP fallback cannot discard search controls"
+            )
+        if self.native_fallback is None:
+            raise RuntimeError("Native Windows LDAP was not selected")
+        client = WindowsLdapClient(
+            self.dc or self.domain, self.port or 389, self.native_fallback
+        )
+        if self.selected_backend != "windows":
+            logger.warning(
+                "Using current-user Windows LDAP after eligible ldap3 failure"
+            )
+        else:
+            logger.debug("Reusing the selected current-user Windows LDAP backend")
+        self.selected_backend = "windows"
+        try:
+            with closing(
+                client.search(
+                    search_filter, attributes, base, scope, size_limit, paged_size
+                )
+            ) as entries:
+                for entry in entries:
+                    yield self._entry_to_dict(entry)
+        except WindowsLdapError as error:
+            if error.code == 49:
+                logger.warning(
+                    "Windows LDAP rejected the current identity; no further submissions will be made"
+                )
+                self._credential_failure = error
+            raise
+
     def paged_search(
+        self,
+        search_filter: str,
+        attributes: list[str],
+        base: Optional[str] = None,
+        scope: Literal["BASE", "LEVEL", "SUBTREE"] = SUBTREE,
+        size_limit: int = 0,
+        paged_size: int = 1000,
+        controls: Optional[list[str]] = None,
+    ) -> Iterable[dict[str, Any]]:
+        """Read pages under one optional budget, including bind and result cleanup."""
+        rows = self._paged_search(
+            search_filter, attributes, base, scope, size_limit, paged_size, controls
+        )
+        if self.read_control is None:
+            yield from rows
+            return  # Existing consumers keep their search timeout policy.
+        if not self._search_guard.acquire(blocking=False):
+            logger.error("An LDAP client cannot run overlapping searches")
+            raise RuntimeError("An LDAP client cannot run overlapping searches")
+        operation = None
+        try:
+            operation = self.read_control.operation("LDAP search", self._interrupt)
+            with operation, closing(rows):
+                self._search_operation = operation
+                for row in rows:
+                    operation.check()
+                    yield row
+                operation.check()
+        except BaseException as error:
+            if isinstance(error, ReadStoppedError) or (
+                operation is not None and operation.is_stopped
+            ):
+                logger.warning("LDAP search stopped; closing its owned connection")
+                self.close()
+                if isinstance(error, ClientCleanupError):
+                    raise
+                raise ReadStoppedError("LDAP search was stopped") from error
+            raise
+        finally:
+            self._search_operation = None
+            self._search_guard.release()
+
+    def _paged_search(
         self,
         search_filter: str,
         attributes: list[str],
@@ -817,21 +1291,50 @@ class AdClient:
         size_limit: int = 0,
         paged_size: int = 1000,
         controls: Optional[list[str]] = None,
-    ) -> Iterable[dict[str, Any]]:
+    ) -> Generator[dict[str, Any], None, None]:
         """Yield each matching entry as a dict {attr: value}, decoding SIDs/GUIDs.
 
         Paged at *paged_size* (1000, matching the Go controls + AD's default
         cap). A server-side error (e.g. ``noSuchObject``) is logged and stops
         iteration rather than raising into the caller's generator.
         """
-        conn = self.bind()
         base_dn = base or self.base_dn
         logger.verbose("LDAP search: base=%s filter=%s", base_dn, search_filter)
         total = 0
         page = 0
+        started = time.monotonic()
+        failure: str | None = None
+        completed = False
+        connection_ready = False
         try:
+            if self._credential_failure is not None:
+                logger.warning(
+                    "LDAP identity was already rejected; refusing another search"
+                )
+                raise self._credential_failure
+            if self.selected_backend == "windows":
+                with closing(
+                    self._native_entries(
+                        search_filter,
+                        attributes,
+                        base_dn,
+                        scope,
+                        size_limit,
+                        paged_size,
+                        controls,
+                    )
+                ) as entries:
+                    for row in entries:
+                        total += 1
+                        yield row
+                completed = True
+                return
+            conn = self.bind()
+            connection_ready = True
             cookie = None
             while True:
+                if self._search_operation is not None:
+                    self._search_operation.check()
                 conn.search(
                     search_base=base_dn,
                     search_filter=search_filter,
@@ -842,33 +1345,106 @@ class AdClient:
                     size_limit=size_limit,
                     controls=controls,
                 )
+                if self._search_operation is not None:
+                    self._search_operation.check()
                 result = conn.result or {}
+                if not result:
+                    logger.warning("LDAP search returned no completion result")
+                    failure = "LDAP search returned no completion result"
+                    break
                 desc = result.get("description")
                 if desc and desc.lower() not in ("success", "sizelimitexceeded"):
                     # Server reported an error without raising — surface it.
                     logger.warning(
                         "LDAP search returned %s (base=%s filter=%s): %s",
-                        desc, base_dn, search_filter, result.get("message") or "",
+                        desc,
+                        base_dn,
+                        search_filter,
+                        result.get("message") or "",
                     )
+                    failure = "LDAP server rejected the search; see the run logs"
                     break
                 page += 1
                 total += len(conn.entries)
                 for entry in conn.entries:
                     yield self._entry_to_dict(entry)
+                if desc and desc.lower() == "sizelimitexceeded" and not size_limit:
+                    logger.warning(
+                        "LDAP server truncated a search with no caller-selected size limit"
+                    )
+                    failure = "LDAP server truncated the search; results are incomplete"
+                    break
                 cookie = (
                     result.get("controls", {})
                     .get("1.2.840.113556.1.4.319", {})
                     .get("value", {})
                     .get("cookie")
                 )
-                if not cookie:
+                if not cookie or (size_limit > 0 and total >= size_limit):
                     # No continuation cookie — last page consumed.
+                    completed = True
                     break
-        except LDAPException as exc:
-            logger.warning("LDAP search failed (filter=%s, base=%s): %s", search_filter, base_dn, exc)
+        except ClientCleanupError:
+            failure = "LDAP cleanup failed"
+            logger.error("LDAP cleanup failed; the owning run must fail")
+            raise
+        except Exception as exc:
+            if (
+                total == 0
+                and self.selected_backend != "windows"
+                and self._can_use_native_fallback(exc)
+            ):
+                self.close()
+                with closing(
+                    self._native_entries(
+                        search_filter,
+                        attributes,
+                        base_dn,
+                        scope,
+                        size_limit,
+                        paged_size,
+                        controls,
+                    )
+                ) as entries:
+                    for row in entries:
+                        total += 1
+                        yield row
+                completed = True
+                return
+            failure = "LDAP read failed; see the run logs"
+            logger.warning(
+                "LDAP search failed (filter=%s, base=%s): %s",
+                search_filter,
+                base_dn,
+                exc,
+            )
+            if not connection_ready or not isinstance(exc, LDAPException):
+                raise  # Keep existing bind failures visible to the caller.
+        except BaseException:
+            failure = "LDAP read did not finish; see the run logs"
+            logger.warning("LDAP read ended before completion")
+            raise
         finally:
+            result = OperationResult(
+                "Windows LDAP search"
+                if self.selected_backend == "windows"
+                else "LDAP search",
+                "completed" if completed and failure is None else "failed",
+                total if completed and failure is None else None,
+                int((time.monotonic() - started) * 1000),
+                failure
+                if failure is not None
+                else (None if completed else "LDAP read did not finish"),
+            )
+            self.last_query_result = result
+            if self.on_query is not None:
+                self.on_query(result)
+            # Existing consumers do not opt into saved query outcomes.
             logger.verbose(
-                "LDAP search complete: entries=%d pages=%d", total, page,)
+                "LDAP search complete: entries=%d pages=%d",
+                total,
+                page,
+            )
 
     # Map wire-protocol (lowercased) attribute names to clean output keys.
     _ATTR_KEY_MAP: dict[str, str] = {
@@ -930,20 +1506,32 @@ class AdClient:
         results: list[dict[str, Any]] = []
         for entry in self.paged_search(
             search_filter=search_filter,
-            attributes=["servicePrincipalName", "sAMAccountName", "objectSid", "distinguishedName"],
+            attributes=[
+                "servicePrincipalName",
+                "sAMAccountName",
+                "objectSid",
+                "distinguishedName",
+            ],
         ):
             spns = entry.get("servicePrincipalName")
             if spns is None:
                 # Defensive: a match with no SPN value is unexpected; skip it.
-                logger.debug("enumerate_spns: entry %s had no SPN values", entry.get("distinguishedName"))
+                logger.debug(
+                    "enumerate_spns: entry %s had no SPN values",
+                    entry.get("distinguishedName"),
+                )
                 continue
-            results.append({
-                "servicePrincipalName": spns if isinstance(spns, list) else [spns],
-                "distinguishedName": entry.get("distinguishedName"),
-                "objectSid": entry.get("objectSid"),
-                "sAMAccountName": entry.get("sAMAccountName"),
-            })
-        logger.info("enumerate_spns: %d account(s) matched %s", len(results), search_filter)
+            results.append(
+                {
+                    "servicePrincipalName": spns if isinstance(spns, list) else [spns],
+                    "distinguishedName": entry.get("distinguishedName"),
+                    "objectSid": entry.get("objectSid"),
+                    "sAMAccountName": entry.get("sAMAccountName"),
+                }
+            )
+        logger.info(
+            "enumerate_spns: %d account(s) matched %s", len(results), search_filter
+        )
         return results
 
     def enumerate_computers(self) -> list[dict[str, Any]]:
@@ -960,12 +1548,14 @@ class AdClient:
             search_filter=search_filter,
             attributes=["dNSHostName", "name", "objectSid", "distinguishedName"],
         ):
-            results.append({
-                "dnsHostName": entry.get("dnsHostName"),
-                "name": entry.get("name"),
-                "objectSid": entry.get("objectSid"),
-                "distinguishedName": entry.get("distinguishedName"),
-            })
+            results.append(
+                {
+                    "dnsHostName": entry.get("dnsHostName"),
+                    "name": entry.get("name"),
+                    "objectSid": entry.get("objectSid"),
+                    "distinguishedName": entry.get("distinguishedName"),
+                }
+            )
         logger.info("enumerate_computers: %d computer(s) found", len(results))
         return results
 
@@ -980,8 +1570,14 @@ class AdClient:
         if sid in self._sid_cache:
             return self._sid_cache[sid]
 
-        attrs = ["sAMAccountName", "distinguishedName", "objectClass",
-                 "userAccountControl", "dNSHostName", "userPrincipalName"]
+        attrs = [
+            "sAMAccountName",
+            "distinguishedName",
+            "objectClass",
+            "userAccountControl",
+            "dNSHostName",
+            "userPrincipalName",
+        ]
 
         # AD matches objectSid against the canonical S-1-... string form (the
         # SDDL syntax), which ldap3 passes through cleanly. Try that first.
@@ -1022,8 +1618,15 @@ class AdClient:
 
         entry = self._first_entry(
             f"(sAMAccountName={escape_filter_chars(sam)})",
-            ["sAMAccountName", "distinguishedName", "objectClass", "objectSid",
-             "userAccountControl", "dNSHostName", "userPrincipalName"],
+            [
+                "sAMAccountName",
+                "distinguishedName",
+                "objectClass",
+                "objectSid",
+                "userAccountControl",
+                "dNSHostName",
+                "userPrincipalName",
+            ],
         )
         if entry is None:
             logger.debug("resolve_principal: name %s not found", name)
@@ -1039,13 +1642,25 @@ class AdClient:
 
     # ----------------------------------------------------------- query helpers --
 
-    def _first_entry(self, search_filter: str, attributes: list[str]) -> Optional[dict[str, Any]]:
+    def _first_entry(
+        self, search_filter: str, attributes: list[str]
+    ) -> Optional[dict[str, Any]]:
         """Return the first matching entry dict, or None. size_limit=1."""
-        for entry in self.paged_search(search_filter=search_filter, attributes=attributes, size_limit=1, paged_size=1):
-            return entry
-        return None
+        # Consume the explicitly limited read so its outcome is finalized before
+        # returning to the caller. There is no abandoned generator to clean up.
+        entries = list(
+            self.paged_search(
+                search_filter=search_filter,
+                attributes=attributes,
+                size_limit=1,
+                paged_size=1,
+            )
+        )
+        return entries[0] if entries else None
 
-    def _build_principal(self, entry: dict[str, Any], *, sid: Optional[str]) -> dict[str, Any]:
+    def _build_principal(
+        self, entry: dict[str, Any], *, sid: Optional[str]
+    ) -> dict[str, Any]:
         """Shape an LDAP entry dict into the resolve_* return contract."""
         sam = entry.get("sAMAccountName")
         dn = entry.get("distinguishedName")
@@ -1055,7 +1670,9 @@ class AdClient:
         # objectClass arrives as a list (e.g. top/person/user); pick the most
         # specific recognized class, matching Go's switch.
         classes = entry.get("objectClass")
-        classes = classes if isinstance(classes, list) else ([classes] if classes else [])
+        classes = (
+            classes if isinstance(classes, list) else ([classes] if classes else [])
+        )
         lowered = {str(c).lower() for c in classes}
         # Optional because the final fallback can find no class at all to report.
         obj_type: Optional[str]
@@ -1067,7 +1684,7 @@ class AdClient:
             obj_type = "user"
         else:
             # Fall back to the first raw class so the caller still gets a hint.
-            obj_type = (classes[0] if classes else None)
+            obj_type = classes[0] if classes else None
 
         # Enabled: UAC flag 0x2 (ACCOUNTDISABLE). Absent UAC → treat as enabled.
         uac_raw = entry.get("userAccountControl")
@@ -1079,7 +1696,9 @@ class AdClient:
                 enabled = not (int(uac_raw) & 0x2)
             except (TypeError, ValueError):
                 # Non-numeric UAC — can't decide; default to enabled and log.
-                logger.debug("_build_principal: non-numeric userAccountControl %r", uac_raw)
+                logger.debug(
+                    "_build_principal: non-numeric userAccountControl %r", uac_raw
+                )
 
         # Name selection mirrors Go ResolveSID:
         #   computer → dnsHostName else DOMAIN\sam

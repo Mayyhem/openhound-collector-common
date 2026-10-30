@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import logging
 import zipfile
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from .resources import RunResources
 
 if TYPE_CHECKING:  # type hints only — never import the framework at runtime
     from openhound.core.app import OpenHound
@@ -42,8 +44,8 @@ class StagePaths:
     """
 
     dataset_dir: Path  # convert input: the dlt dataset dir (OUTPUT_PATH / app.name)
-    lookup_db: Path    # preproc output and convert lookup (OUTPUT_PATH / lookup.duckdb)
-    graph_out: Path    # convert output dir (OUTPUT_PATH / graph)
+    lookup_db: Path  # preproc output and convert lookup (OUTPUT_PATH / lookup.duckdb)
+    graph_out: Path  # convert output dir (OUTPUT_PATH / graph)
     # The bundled archive run_end_to_end wrote, or None when none was (convert emitted
     # no *.json, or these paths were merely derived rather than run). Reporting the
     # archive that exists beats a caller reconstructing where one *should* be: the two
@@ -69,7 +71,12 @@ def derive_stage_paths(app: "OpenHound", output_path: Path) -> StagePaths:
     )
 
 
-def zip_graph_output(graph_dir: Path, archive_name: str = _DEFAULT_GRAPH_ZIP_NAME) -> Optional[Path]:
+def zip_graph_output(
+    graph_dir: Path,
+    archive_name: str = _DEFAULT_GRAPH_ZIP_NAME,
+    *,
+    resources: RunResources | None = None,
+) -> Optional[Path]:
     """Bundle every *.json in *graph_dir* into a flat ``graph_dir/<archive_name>``.
 
     The archive stores each file by basename (no directory prefix), which is exactly
@@ -85,13 +92,44 @@ def zip_graph_output(graph_dir: Path, archive_name: str = _DEFAULT_GRAPH_ZIP_NAM
     not errors, so a caller can call this unconditionally after convert.
     """
     if not graph_dir.is_dir():
-        logger.debug("Graph dir %s does not exist; no %s written.", graph_dir, archive_name)
+        logger.debug(
+            "Graph dir %s does not exist; no %s written.", graph_dir, archive_name
+        )
         return None
     json_files = sorted(graph_dir.glob("*.json"))
     if not json_files:
         logger.warning("No *.json in %s; skipping %s.", graph_dir, archive_name)
         return None
     zip_path = graph_dir / archive_name
+    if resources is not None:
+        resources.register_path(graph_dir)
+        resources.check(sample_now=True)
+        with tempfile.NamedTemporaryFile(
+            prefix=".archive-", suffix=".zip.tmp", dir=graph_dir, delete=False
+        ) as temporary:
+            owned = Path(temporary.name)
+        try:
+            with zipfile.ZipFile(
+                owned, "w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
+                for file in json_files:
+                    resources.check()
+                    with (
+                        file.open("rb") as source,
+                        archive.open(file.name, "w", force_zip64=True) as destination,
+                    ):
+                        while chunk := source.read(1024 * 1024):
+                            resources.check()
+                            destination.write(chunk)
+            resources.check(sample_now=True)
+            owned.replace(zip_path)
+            resources.sample()
+        finally:
+            # Only this newly created temporary ZIP is removed on failure. The
+            # complete loose files and any previous archive remain available.
+            owned.unlink(missing_ok=True)
+        logger.info("Bundled %d graph files into %s", len(json_files), zip_path)
+        return zip_path
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for f in json_files:
             zf.write(f, arcname=f.name)  # arcname = basename -> flat archive
@@ -118,6 +156,7 @@ def run_end_to_end(
     *,
     progress: "Optional[Progress]" = None,
     graph_zip_name: Optional[str] = None,
+    resources: RunResources | None = None,
 ) -> StagePaths:
     """Run *app*'s preproc then convert stages in-process, chained off one collect run.
 
@@ -138,11 +177,19 @@ def run_end_to_end(
     # convert; without both there is nothing to chain, so fail loudly and early
     # (before touching disk) rather than half-running.
     if app.preprocessor is None:
-        logger.error("Cannot run end-to-end for '%s': no preproc hook is registered.", app.name)
-        raise RuntimeError(f"{app.name}: no preproc hook registered; cannot run end-to-end.")
+        logger.error(
+            "Cannot run end-to-end for '%s': no preproc hook is registered.", app.name
+        )
+        raise RuntimeError(
+            f"{app.name}: no preproc hook registered; cannot run end-to-end."
+        )
     if app.converter is None:
-        logger.error("Cannot run end-to-end for '%s': no convert hook is registered.", app.name)
-        raise RuntimeError(f"{app.name}: no convert hook registered; cannot run end-to-end.")
+        logger.error(
+            "Cannot run end-to-end for '%s': no convert hook is registered.", app.name
+        )
+        raise RuntimeError(
+            f"{app.name}: no convert hook registered; cannot run end-to-end."
+        )
 
     paths = derive_stage_paths(app, output_path)
 
@@ -163,7 +210,9 @@ def run_end_to_end(
         logger.debug("Convert progress silenced (dlt NULL_COLLECTOR).")
     else:
         convert_progress = progress
-        logger.debug("Convert progress backend: %s", getattr(progress, "value", progress))
+        logger.debug(
+            "Convert progress backend: %s", getattr(progress, "value", progress)
+        )
 
     logger.info("Converting collected data into OpenGraph: %s", paths.graph_out)
     app.converter(
@@ -175,7 +224,12 @@ def run_end_to_end(
     logger.info("Convert complete. Graph written to: %s", paths.graph_out)
     # One upload-ready archive for BloodHound File Ingest; a no-op if convert wrote no json.
     # Collector-agnostic default name; the caller may pass a run-specific one.
-    graph_zip = zip_graph_output(paths.graph_out, graph_zip_name or f"{app.name}_collection.zip")
+    archive_name = graph_zip_name or f"{app.name}_collection.zip"
+    graph_zip = (
+        zip_graph_output(paths.graph_out, archive_name, resources=resources)
+        if resources is not None
+        else zip_graph_output(paths.graph_out, archive_name)
+    )
 
     # Frozen dataclass, so hand back a new one carrying what was actually written.
     # Without this the archive path was unreportable: the caller knew only the name

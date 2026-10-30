@@ -23,6 +23,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 
 def test_importing_mssql_client_emits_no_syntax_warning(tmp_path):
     program = textwrap.dedent(
@@ -44,6 +46,10 @@ def test_importing_mssql_client_emits_no_syntax_warning(tmp_path):
     assert "clean" in done.stdout, done.stdout
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 14),
+    reason="Python 3.14 introduced the return-in-finally SyntaxWarning (PEP 765)",
+)
 def test_the_guard_is_scoped_and_does_not_hide_our_own_return_in_finally(tmp_path):
     """The guard must not leave a process-wide filter behind.
 
