@@ -478,6 +478,9 @@ class AdClient:
             raise ValueError("Native LDAP fallback requires ReadControl")
         self.selected_backend = "ldap3"
         self._credential_failure: Exception | None = None
+        # Where a definite rejection happened during a timed sign-in or search,
+        # until that read's timer has finished and it is reported to the guard.
+        self._unreported_rejection: str | None = None
         self.base_dn = (
             ",".join(f"DC={part}" for part in domain.split(".")) if domain else ""
         )
@@ -499,6 +502,10 @@ class AdClient:
                 self._bind_operation = operation
                 return self._bind()
         except BaseException as error:
+            if self._unreported_rejection is not None:
+                # The domain controller refused this sign-in. That is the
+                # reason, even if a stop or the time limit arrived meanwhile.
+                raise
             if isinstance(error, ReadStoppedError) or (
                 operation is not None and operation.is_stopped
             ):
@@ -512,6 +519,9 @@ class AdClient:
             raise
         finally:
             self._bind_operation = None
+            if self._search_operation is None:
+                self._report_rejection()
+            # Inside a search, the search reports it once its own timer finishes.
 
     def has_supplied_credentials(self) -> bool:
         """True when a password, hash or Kerberos ticket or key was supplied.
@@ -544,7 +554,9 @@ class AdClient:
             if self._credential_failure is not None or isinstance(
                 error, CredentialsRejectedError
             ):
-                logger.error(
+                # Debug only: the run-wide record has already logged the
+                # refusal, and the collector tells the person what to do next.
+                logger.debug(
                     "The sign-in details were rejected before any computer was visited"
                 )
                 return CredentialCheck.REJECTED
@@ -569,12 +581,27 @@ class AdClient:
         self._credential_failure = error
         if self.credential_guard is None:
             return  # No run-wide record was supplied; only this client stops.
-        if is_definite:
-            self.credential_guard.record_rejection(rejected_by)
-        else:
+        if not is_definite:
             logger.debug(
                 "This directory sign-in problem does not prove the password was wrong"
             )
+        elif self._bind_operation is None and self._search_operation is None:
+            self.credential_guard.record_rejection(rejected_by)
+        else:
+            # Reporting stops the whole run. Reported now, that stop would reach
+            # this client's own timer, which would then log the refusal as a
+            # stopped sign-in. bind() or paged_search() reports it on the way out.
+            logger.debug(
+                "Reporting the refused directory sign-in once its timed read ends"
+            )
+            self._unreported_rejection = rejected_by
+
+    def _report_rejection(self) -> None:
+        """Report a rejection held back until this client's timed read ended."""
+        rejected_by, self._unreported_rejection = self._unreported_rejection, None
+        if rejected_by is None or self.credential_guard is None:
+            return  # Nothing was refused during the read that just ended.
+        self.credential_guard.record_rejection(rejected_by)
 
     def _bind(self) -> Connection:
         if self._credential_failure is not None:
@@ -1045,7 +1072,9 @@ class AdClient:
                 raise LDAPBindError("StartTLS before the LDAP bind failed")
             # The schema and server details are read once, just below.
             if not connection.bind(read_server_info=False):
-                logger.warning("The LDAP bind was rejected")
+                # Debug only: the caller logs the outcome with the domain
+                # controller's reason, so a warning here would repeat it.
+                logger.debug("The LDAP bind was rejected")
                 # The result includes the domain controller's reason, such as
                 # "data 52e", which decides whether another profile is safe.
                 raise LDAPBindError(str(connection.result))
@@ -1404,6 +1433,10 @@ class AdClient:
                     yield row
                 operation.check()
         except BaseException as error:
+            if self._unreported_rejection is not None:
+                # The domain controller refused a sign-in during this search.
+                # That is the reason, even if a stop arrived meanwhile.
+                raise
             if isinstance(error, ReadStoppedError) or (
                 operation is not None and operation.is_stopped
             ):
@@ -1416,6 +1449,7 @@ class AdClient:
         finally:
             self._search_operation = None
             self._search_guard.release()
+            self._report_rejection()
 
     def _paged_search(
         self,

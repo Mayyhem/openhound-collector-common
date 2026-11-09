@@ -9,9 +9,10 @@ one-time sign-in check, and the WMI and Kerberos reports to the record.
 
 from __future__ import annotations
 
+import logging
 import socket
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 from ldap3 import AUTO_BIND_NONE
@@ -54,7 +55,9 @@ def forbid_network(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", forbidden)
 
 
-def directory_client(monkeypatch, guard=None, *, controlled=False, password=True):
+def directory_client(
+    monkeypatch, guard=None, *, controlled=False, password=True, stop_event=None
+):
     """A real client whose only replaced parts are discovery and the provider."""
     client = ad.AdClient(
         "example.test",
@@ -62,7 +65,7 @@ def directory_client(monkeypatch, guard=None, *, controlled=False, password=True
         auth=ad.LdapAuth(username="EXAMPLE\\reader", password=EXAMPLE_PASSWORD)
         if password
         else ad.LdapAuth(),
-        read_control=ReadControl(2) if controlled else None,
+        read_control=ReadControl(2, stop_event=stop_event) if controlled else None,
         credential_guard=guard,
     )
     monkeypatch.setattr(
@@ -82,6 +85,13 @@ def failing_provider(monkeypatch, client, failure):
 
     monkeypatch.setattr(client, "_open_connection", open_connection)
     return calls
+
+
+def logged_levels(caplog, text):
+    """The levels at which a message containing this text was logged."""
+    return {
+        record.levelname for record in caplog.records if text in record.getMessage()
+    }
 
 
 # --- the run-wide record ----------------------------------------------------
@@ -222,9 +232,10 @@ def test_channel_binding_reply_still_tries_the_next_profile_with_a_guard(monkeyp
 
 @pytest.mark.parametrize("controlled", [False, True])
 def test_every_password_bind_keeps_the_domain_controllers_reason(
-    monkeypatch, controlled
+    monkeypatch, caplog, controlled
 ):
     """Run the real connection-opening code against a stand-in for ldap3."""
+    caplog.set_level(logging.DEBUG)
     events = []
 
     class Server:
@@ -266,6 +277,47 @@ def test_every_password_bind_keeps_the_domain_controllers_reason(
     assert events == [("created", AUTO_BIND_NONE), "open", ("bind", False), "unbind"]
     assert guard.is_rejected
     assert client._conn is None and client._opening_conn is None
+    # The refusal is logged once, as an error with the domain controller's
+    # reason. The bare "rejected" line stays in the full log only.
+    assert logged_levels(caplog, "failed with a credential error") == {"ERROR"}
+    assert logged_levels(caplog, "The LDAP bind was rejected") == {"DEBUG"}
+
+
+@pytest.mark.parametrize("entry", ["sign-in check", "bind", "search"])
+def test_refusal_that_stops_the_run_is_reported_as_refused_not_stopped(
+    monkeypatch, caplog, entry
+):
+    """A collector links the run's stop signal to every read's timer.
+
+    Reporting a refused password sets that signal. Before the fix, the report
+    happened while the refused sign-in's own timer was still running, so the
+    timer and the client then described the refusal as a stopped sign-in.
+    """
+    stop = Event()
+    guard = CredentialGuard()
+    guard.add_stop_action(stop.set)
+    client = directory_client(monkeypatch, guard, controlled=True, stop_event=stop)
+    calls = failing_provider(
+        monkeypatch,
+        client,
+        LDAPBindError("invalidCredentials: AcceptSecurityContext error, data 52e"),
+    )
+    if entry == "sign-in check":
+        with caplog.at_level(logging.DEBUG):
+            assert client.confirm_credentials() is CredentialCheck.REJECTED
+        # The collector tells the person; this line stays in the full log only.
+        assert logged_levels(caplog, "rejected before any computer") == {"DEBUG"}
+    else:
+        with pytest.raises(LDAPBindError, match="data 52e"):
+            if entry == "bind":
+                client.bind()
+            else:
+                list(client.paged_search("(objectClass=user)", ["cn"]))
+    assert len(calls) == 1
+    assert guard.rejected_by == "The domain controller dc.example.test"
+    assert stop.is_set()  # The run still stops straight away.
+    assert "stopped" not in caplog.text
+    assert "returned after stopping" not in caplog.text
 
 
 def test_sign_in_check_reports_accepted_rejected_unchecked_and_not_needed(monkeypatch):
