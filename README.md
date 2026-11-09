@@ -35,6 +35,7 @@ and hash logins passed in both consumer environments; full acceptance remains pe
 | `clients/credential_guard.py` | One run's shared record that its sign-in details were rejected. Clients check it before signing in and report definite rejections; the first report stops the run. |
 | `clients/kerberos.py` | Run-local identity selection from base64 KRB-CRED, MIT cache v3/v4 or keytab v2; exact service/port matching and one guarded keytab TGT acquisition. |
 | `clients/ldap_kerberos.py` | Explicit Kerberos bind on a normal ldap3 connection; certificate channel binding over TLS and impacket sealing for plain LDAP. |
+| `collection/registry.py` | Shared target indexes, the name-only `matches_allowed_targets`, and `AllowedTargets`: an allowed-target list of names, single addresses and IP ranges that returns an allowed/refused decision with a plain reason. Never looks anything up; callers pass the addresses they found. |
 | `discovery/dns.py` | DC/SRV/A discovery + DNS resolver override (proxy-aware). |
 | `discovery/network.py` | Run-wide forward/reverse DNS and SOCKS selection, exact socket restoration, and TCP reachability checks. |
 | `discovery/domain.py` | Explicit/credential/Windows domain selection and target suffixes verified through LDAP DNS records. |
