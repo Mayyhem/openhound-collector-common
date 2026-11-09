@@ -69,10 +69,12 @@ Only replies that prove the account or its password was refused stop a run:
 - Kerberos replies 6, 18, 23 and 24: unknown account, disabled or locked
   account, expired password, wrong password.
 
-"Access denied" does not count, and neither does SQL Server's "Login failed".
-A correct account that simply lacks access gets those same replies. Stopping on
-them would end ordinary low-privilege collection at the first computer it
-cannot read.
+"Access denied" does not count: a correct account that simply lacks access
+gets it too. SQL Server's replies do not count either. In the lab a wrong
+password got "Login failed. The login is from an untrusted domain", but SQL
+Server sends that same reply when it rejects a connection-security (EPA) value.
+A correct account with no SQL login gets "Login failed for user". Stopping on
+either could end a run with a correct password.
 
 ## How it works in the code
 
@@ -121,8 +123,12 @@ previous monitored path read them twice.
   about the password, and the next method can succeed.
 - **Read the reason from the automatic bind's error.** Not possible: the
   library drops the server's reply before raising.
-- **Stop on SQL Server "Login failed".** Rejected for the reason above: it also
-  means "correct account, no SQL login", which is the normal low-privilege case.
+- **Stop on SQL Server's replies.** Rejected for the reasons above: "untrusted
+  domain" also means a rejected connection-security value, and "Login failed
+  for user" also means "correct account, no SQL login", the normal
+  low-privilege case. (An earlier version of this note said a wrong password
+  and a missing SQL login got the same reply. The lab logs show they differ;
+  the conclusion is unchanged.)
 - **Only stop the queue, with no per-client checks.** Rejected: a computer's
   remaining steps, and workers already running, would still sign in.
 - **Each collector keeps its own record.** Rejected: both collectors need the
@@ -171,14 +177,77 @@ correctly did not stop the run.
 
 ## Manual verification
 
-From this project, in its declared environment:
+Last run exactly as written: November 4, 2026, on ps1-dev. The commands were
+copied from this section and run in order in one fresh PowerShell session.
+Every result matched what is shown here. The two collectors' steps in step 3
+were run the same day and matched too.
+
+This library has no command of its own to run. Its part is checked with its
+tests here, and the real behavior is checked through the two collectors that
+use it.
+
+### Before you start
+
+- Open a new PowerShell window on ps1-dev. These steps don't contact the lab.
+- The first `uv run` in this folder takes a minute or so while it installs the
+  shared library's packages into the folder's `.venv`, which git ignores.
+
+### Step 1: Run the sign-in rejection tests
+
+These cover:
+
+- the run-wide record of a rejection;
+- which directory, Windows and Kerberos replies count as a wrong password;
+- the one-time password check;
+- the WMI and Kerberos connection code;
+- a refused sign-in reported as refused, not as stopped, when the run's stop
+  signal is connected (added November 4; see
+  [its note](2026-11-04-refused-sign-in-reported-as-refused.md)).
 
 ```powershell
-uv run --locked pytest tests/test_credential_guard.py tests/test_ldap_rejection_contracts.py tests/test_kerberos_credentials.py tests/test_wmi_inprocess.py -q
+Set-Location C:\Users\domainadmin\openhound-collector-common
+uv run --locked pytest tests\test_credential_guard.py tests\test_ldap_rejection_contracts.py tests\test_kerberos_credentials.py tests\test_wmi_inprocess.py -q
+```
+
+**You should see** `111 passed` on the last line.
+
+### Step 2 (optional): Run the engineers' code checks
+
+These are the style and type checks reviewers will run. They read the code
+without running it.
+
+```powershell
 uv run --locked ruff check src tests
 uv run --locked mypy src
 ```
 
-The lab scripts and saved results are in the private feature work folder:
-`tests/sccm_wrong_password_run_count.ps1`, `tests/wrong_password_run_count.ps1`
-and `tests/correct_password_run_check.ps1`, with matching `*-lab.txt` results.
+**You should see** `All checks passed!` from the first, and
+`Success: no issues found in 65 source files` from the second.
+
+### Step 3: Check it in the lab, through the collectors
+
+Follow the manual verification steps in each collector's
+`docs/changes/2026-10-30-one-rejected-sign-in.md`:
+
+- the SQL collector's steps show one failed sign-in for two servers, no server
+  contacted, and a correct password unaffected;
+- the SCCM collector's steps show one failed sign-in where there used to be 82,
+  and a correct password unaffected.
+
+### What these steps prove
+
+- **The shared rules work as this note says.** Step 1's tests cover which
+  replies count as a wrong password, the run-wide record, the one-time
+  check, and the WMI and Kerberos connection code.
+- **The code passes the reviewers' checks** (step 2).
+- **A real wrong password costs one failed sign-in, and a correct one is
+  unaffected**, through both collectors (step 3).
+
+### Clean up
+
+Nothing to clean up here. Each collector's steps include their own clean-up.
+
+Earlier lab evidence, from before these steps existed, is in the private
+feature work folder: `sccm-wrong-password-run-count-after-fix-lab.txt`,
+`wrong-password-run-count-after-fix-lab.txt` and
+`correct-password-run-check-lab.txt`.
