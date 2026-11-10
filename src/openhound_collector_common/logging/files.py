@@ -72,14 +72,18 @@ class DiagnosticFileHandler(logging.FileHandler, _WriteFailure):
 
     The file is created only for a qualifying record. Copies prevent traceback
     formatting from changing another console/file handler's view of the record.
+    With ``write=False``, only warning/error counts are retained; no file is opened.
     """
 
-    def __init__(self, path: Path, *, secrets: Iterable[str] = ()) -> None:
+    def __init__(
+        self, path: Path, *, secrets: Iterable[str] = (), write: bool = True,
+    ) -> None:
         super().__init__(str(path.resolve()), mode="w", encoding="utf-8", delay=True)
         self.redactor = SecretRedactor(secrets)
         self.failure = None
         self.warning_count = 0
         self.error_count = 0
+        self._write = write
         self._has_closed = False
         self.setLevel(logging.DEBUG)
         self.setFormatter(
@@ -108,6 +112,9 @@ class DiagnosticFileHandler(logging.FileHandler, _WriteFailure):
         elif record.levelno >= logging.WARNING:
             self.warning_count += 1
         # Companion debug records do not increase warning/error totals.
+        if not self._write:
+            # Count-only diagnostics deliberately perform no formatting or file I/O.
+            return
         saved = copy.copy(record)
         saved.exc_text = None
         if not saved.exc_info and active_exception[0] is not None:
@@ -262,6 +269,8 @@ class RunFileLogs:
     Call close from the command's finally block, or use this as a context manager.
     finish_collection can release the grouped full log while keeping issues alive
     through later stages, matching ConfigManBearPig's existing lifecycle.
+    File choices default to enabled. Disabling issues output retains its counts;
+    disabling full output allocates no spool or completion callbacks.
     """
 
     def __init__(
@@ -275,6 +284,8 @@ class RunFileLogs:
         per_target: bool = False,
         scratch_directory: Path | None = None,
         formatter: logging.Formatter | None = None,
+        write_full: bool = True,
+        write_issues: bool = True,
     ) -> None:
         if (
             re.fullmatch(r"[A-Za-z0-9_-]+", run_id) is None
@@ -289,18 +300,22 @@ class RunFileLogs:
         self.run_id = run_id
         self.full_path = directory / f"{stage}_full_{run_id}.log"
         self.issues_path = directory / f"{stage}_issues_{run_id}.log"
+        self.write_issues = write_issues
         self.target_directory = (
-            directory / f"{stage}_targets_{run_id}" if per_target else None
+            directory / f"{stage}_targets_{run_id}" if per_target and write_full else None
         )
-        self.full = GroupedFileHandler(
-            self.full_path,
-            logging.DEBUG,
-            secrets=secrets,
-            scratch_directory=scratch_directory,
-            target_directory=self.target_directory,
+        self.full = (
+            GroupedFileHandler(
+                self.full_path,
+                logging.DEBUG,
+                secrets=secrets,
+                scratch_directory=scratch_directory,
+                target_directory=self.target_directory,
+            )
+            if write_full else None
         )
-        self.issues = DiagnosticFileHandler(self.issues_path, secrets=secrets)
-        if formatter is not None:
+        self.issues = DiagnosticFileHandler(self.issues_path, secrets=secrets, write=write_issues)
+        if formatter is not None and self.full is not None:
             self.full.setFormatter(formatter)
         # CMBP keeps the promoted default format when none is supplied.
         self._namespaces = namespaces
@@ -314,8 +329,15 @@ class RunFileLogs:
     @property
     def owned_log_paths(self) -> tuple[Path, ...]:
         """Expose only this run's full/issues/target files and private log spool."""
-        paths = (self.full_path, self.issues_path, self.full._spool_directory)
-        return (*paths, self.target_directory) if self.target_directory is not None else paths
+        paths: list[Path] = []
+        if self.full is not None:
+            paths.extend((self.full_path, self.full._spool_directory))
+        # Disabled outputs have no files to own or count toward log-space limits.
+        if self.write_issues:
+            paths.append(self.issues_path)
+        if self.target_directory is not None:
+            paths.append(self.target_directory)
+        return tuple(paths)
 
     def __enter__(self) -> RunFileLogs:
         if self._started or self._closed:
@@ -337,10 +359,12 @@ class RunFileLogs:
             namespace = logging.getLogger(name)
             self._levels.append((namespace, namespace.level))
             namespace.setLevel(logging.DEBUG)
-        logging.root.addHandler(self.full)
+        if self.full is not None:
+            logging.root.addHandler(self.full)
+            register_host_complete_callback(self.full.flush_host)
+            register_resource_complete_callback(self.full.flush_resource)
+        # A disabled full log has no handler, spool, or callbacks to attach.
         logging.root.addHandler(self.issues)
-        register_host_complete_callback(self.full.flush_host)
-        register_resource_complete_callback(self.full.flush_resource)
         return self
 
     def finish_collection(self) -> None:
@@ -348,12 +372,16 @@ class RunFileLogs:
         if self._collection_finished:
             return  # Repeated cleanup must not unregister another session's hooks.
         self._collection_finished = True
-        unregister_host_complete_callback(self.full.flush_host)
-        unregister_resource_complete_callback(self.full.flush_resource)
-        logging.root.removeHandler(self.full)
+        if self.full is not None:
+            unregister_host_complete_callback(self.full.flush_host)
+            unregister_resource_complete_callback(self.full.flush_resource)
+            logging.root.removeHandler(self.full)
+        # Namespace restoration also applies when only counts were requested.
         for namespace, level in self._levels:
             namespace.setLevel(level)
-        self.full.close()
+        if self.full is not None:
+            self.full.close()
+        # There is no full-log handler to release when its output is disabled.
 
     def close(self) -> None:
         """Release both handlers even when flushing one of them fails."""

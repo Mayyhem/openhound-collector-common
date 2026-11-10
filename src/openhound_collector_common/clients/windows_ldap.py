@@ -245,6 +245,12 @@ class WindowsLdapClient:
                 self._handle, 0x01, ctypes.byref(descriptor)
             )
             if result == 0 and descriptor.value != ctypes.c_size_t(-1).value:
+                if sys.platform != "win32":
+                    logger.error(
+                        "Native Windows LDAP socket cancellation is unavailable on this platform"
+                    )
+                    raise RuntimeError("Native LDAP socket cancellation requires Windows")
+                # Windows was selected when this session opened; no extra platform log is needed.
                 shutdown = ctypes.WinDLL("Ws2_32.dll").shutdown
                 shutdown.argtypes = (ctypes.c_size_t, ctypes.c_int)
                 shutdown.restype = ctypes.c_int

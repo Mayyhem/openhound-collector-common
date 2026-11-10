@@ -7,7 +7,6 @@ their current output unless they explicitly select this formatter.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sys
 from collections.abc import Iterable
@@ -223,7 +222,9 @@ def console_supports_color(stream: TextIO, *, no_color: bool = False) -> bool:
     if no_color or not stream.isatty():
         # Redirected or explicitly plain output needs no terminal setup.
         return False
-    if os.name != "nt":
+    if sys.platform != "win32":
+        # Other terminals need no Windows console setup. A direct platform check
+        # also keeps Windows-only APIs out of Linux's code-checking path.
         return True
     # Match the Windows reference's GetConsoleMode/SetConsoleMode behavior.
     import ctypes

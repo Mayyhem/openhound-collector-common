@@ -1275,7 +1275,7 @@ class SQLAuthError(Exception):
 # EPA detection (the 5-probe matrix + decision tree)
 # ---------------------------------------------------------------------------
 class EPAPrereqError(Exception):
-    """Baseline login neither authenticated nor cleanly failed — EPA unknowable."""
+    """A required login probe did not produce usable evidence of EPA enforcement."""
 
 
 @dataclass
@@ -1312,7 +1312,8 @@ def detect_epa(
 
     Raises :class:`EPAPrereqError` if the baseline (correct-bindings) login does
     not cleanly succeed or "login failed", because then the manipulated-binding
-    probes cannot be trusted.
+    probes cannot be trusted. Also raises if a required manipulated-binding
+    probe fails in transport or returns an unrecognized authentication result.
     """
     parsed = parse_target(target)
     spn = auth.spn or default_spn(parsed.host, parsed.port)
@@ -1378,18 +1379,31 @@ def _classify_binding(
     rejected when EPA is on (Windows always includes the AV pairs), so Allowed
     and Required are indistinguishable -> literal "Allowed/Required".
     """
-    bogus = probe(bogus_mode)
+    def checked_probe(mode: str) -> _ProbeOutcome:
+        """Only completed, recognized authentication replies establish policy."""
+        outcome = probe(mode)
+        if not (outcome.success or outcome.is_login_failed or outcome.is_untrusted_domain):
+            logger.warning("EPA %s probe was inconclusive; protection is unknown", mode)
+            raise EPAPrereqError(f"EPA {mode} probe was inconclusive; protection is unknown")
+        # The caller interprets these known outcomes; there is no additional action here.
+        return outcome
+
+    bogus = checked_probe(bogus_mode)
     if not bogus.is_untrusted_domain:
         # Server accepted a garbage binding -> not checking bindings at all.
+        logger.debug("EPA bogus binding reached authentication; protection is Off")
         return "Off"
-    missing = probe(missing_mode)
+    missing = checked_probe(missing_mode)
     if missing.is_untrusted_domain:
         # Both bogus and missing rejected.
         if auth_method == "sspi":
             # SSPI cannot distinguish Allowed from Required — surface ambiguity.
+            logger.debug("EPA bindings rejected under SSPI; Allowed/Required remains ambiguous")
             return "Allowed/Required"
+        logger.debug("EPA bogus and missing bindings rejected; protection is Required")
         return "Required"
     # Bogus rejected but missing accepted -> server checks but does not require.
+    logger.debug("EPA missing binding reached authentication; protection is Allowed")
     return "Allowed"
 
 

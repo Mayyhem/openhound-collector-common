@@ -20,6 +20,53 @@ from openhound_collector_common.logging.files import (
 from openhound_collector_common.logging.log_context import target_context
 
 
+@pytest.mark.parametrize("write_full", [True, False])
+@pytest.mark.parametrize("write_issues", [True, False])
+def test_independent_file_choices_preserve_counts_without_disabled_artifacts(
+    tmp_path, write_full, write_issues,
+):
+    before = tuple(logging.root.handlers)
+    with RunFileLogs(
+        tmp_path, run_id="choices", namespaces=("file-choice-check",),
+        write_full=write_full, write_issues=write_issues,
+        scratch_directory=tmp_path,
+    ) as session:
+        log = logging.getLogger("file-choice-check")
+        log.info("ordinary detail")
+        log.warning("illustrative warning")
+        log.error("illustrative error")
+        assert session.issues.warning_count == 1
+        assert session.issues.error_count == 1
+        if not write_full:
+            assert not list(tmp_path.glob("openhound-logs-*"))
+        paths = session.owned_log_paths
+        assert (session.full_path in paths) is write_full
+        assert (session.issues_path in paths) is write_issues
+    assert session.full_path.exists() is write_full
+    assert session.issues_path.exists() is write_issues
+    assert not list(tmp_path.glob("openhound-logs-*"))
+    assert tuple(logging.root.handlers) == before
+    session.close()  # Repeated shutdown must also work with either handler disabled.
+
+
+def test_disabled_full_log_registers_no_callbacks_or_target_files(monkeypatch, tmp_path):
+    from openhound_collector_common.logging import files
+
+    calls = []
+    monkeypatch.setattr(files, "register_host_complete_callback", lambda callback: calls.append(callback))
+    monkeypatch.setattr(files, "register_resource_complete_callback", lambda callback: calls.append(callback))
+    with RunFileLogs(
+        tmp_path, run_id="none", namespaces=("file-choice-check",),
+        write_full=False, write_issues=False, per_target=True,
+        scratch_directory=tmp_path,
+    ) as session:
+        logging.getLogger("file-choice-check").warning("count without writing")
+        assert session.issues.warning_count == 1
+        assert session.owned_log_paths == ()
+    assert calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     "name",
     ["ntHash", "ldapPassword", "rawNTLMResponse", "keytabPath", "kerberosTicket"],

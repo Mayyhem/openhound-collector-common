@@ -13,8 +13,11 @@ def node(identifier):
 
 
 def documents(output):
+    # Filesystems can list part 2 before part 1. Read the numbered filenames in
+    # order so batch assertions test the writer rather than directory ordering.
     return [
-        json.loads(path.read_text(encoding="utf-8")) for path in output.glob("*.json")
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(output.glob("*.json"))
     ]
 
 

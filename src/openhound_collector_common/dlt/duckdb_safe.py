@@ -44,6 +44,7 @@ def safe_execute(
     *,
     expected_miss: Optional[ExpectedMiss] = None,
     logger: Optional[logging.Logger] = None,
+    raise_on_error: bool = False,
 ) -> None:
     """Run one SQL statement; log and continue if a source table is missing.
 
@@ -57,6 +58,10 @@ def safe_execute(
     this data under a sibling table name") without baking that knowledge in here.
     Any non-catalog DuckDB error is logged at ERROR (it indicates a real SQL bug,
     not a not-yet-collected source).
+
+    With *raise_on_error=True*, genuine SQL errors are re-raised after logging so
+    a caller can report incomplete requested work. Missing source tables keep
+    their existing handling. The default preserves existing consumers' behavior.
 
     On a missing source table this logs a one-line summary naming the label and the
     absent table. When the miss is *unexpected* a companion DEBUG record carries the
@@ -81,6 +86,9 @@ def safe_execute(
             # uncollected source. Only "this table has not been produced yet" is
             # an expected absence; everything else is a bug worth seeing.
             log.error("transform %r failed: %s", label, err)
+            if raise_on_error:
+                raise
+            # Existing consumers may choose to continue after the logged failure.
             return
         downgrade = False
         if expected_miss is not None:
@@ -106,6 +114,9 @@ def safe_execute(
     except duckdb.Error as err:
         # Non-catalog error => a real SQL problem worth surfacing loudly.
         log.error("transform %r failed: %s", label, err)
+        if raise_on_error:
+            raise
+        # Existing consumers may choose to continue after the logged failure.
 
 
 def duckdb_missing_table_name(message: str) -> Optional[str]:

@@ -61,6 +61,25 @@ and hash logins passed in both consumer environments; full acceptance remains pe
 
 ## Consumers
 
+SQL protection detection raises `EPAPrereqError` when a required probe times out,
+fails in transport, or returns an unrecognized authentication result. Such a
+failure cannot establish protection as Off or Allowed. Completed successful or
+plain login-failed replies retain the existing binding decision, as do known
+binding rejections and the current-user SSPI Allowed/Required ambiguity. Consumers
+should save independent host facts and report the missing measurement.
+
+`safe_execute(..., raise_on_error=True)` re-raises genuine DuckDB errors after
+logging them. Its default remains log-and-continue for existing callers. Missing
+source tables retain their existing handling; consumers must separately require
+the prepared tables their conversion needs.
+
+`RunFileLogs(..., write_full=False, write_issues=False)` disables the corresponding
+file outputs independently. Both default to True. Disabling full output creates
+no handler, spool, or completion callbacks. Disabling issues output keeps
+`session.issues.warning_count` and `error_count` through a counting-only handler.
+`owned_log_paths` excludes disabled outputs. Console choices and a collector's
+exit policy remain the consumer's responsibility. No new dependency is needed.
+
 `RunResources(stop_event=..., max_data_bytes=..., memory_threshold=...)` from
 `orchestration.resources` samples at entry and once per second. Register explicit
 artifact paths before writing; `include_existing=True` deliberately counts a
@@ -295,6 +314,12 @@ timed-socket behavior, native overruns, remaining setup limits and verification.
 Current-user Windows WMI initializes and releases Windows COM on its connecting
 thread. Keep an in-process WMI client on that worker through cleanup. Native current-user WMI does not use Python's
 SOCKS sockets; collectors must skip or reject that combination.
+
+Native Windows COM cancellation and native Windows LDAP socket cancellation
+require Windows. Attempting their Windows API calls on another platform logs an
+error and raises `RuntimeError` before loading a Windows library. A native LDAP
+session with no exposed socket still has nothing to stop. Console color setup checks the
+platform separately; non-Windows terminals need no Windows console API.
 
 To request cancellation of a slow current-user or explicit-credential read:
 

@@ -25,6 +25,25 @@ def test_safe_execute_runs_valid_sql(con):
     assert con.execute("SELECT a FROM s.t").fetchone()[0] == 1
 
 
+@pytest.mark.parametrize("statement,error_type", [
+    ("SELECT missing_column FROM (SELECT 1 AS actual_column)", duckdb.BinderException),
+    ("SELECT no_such_function(1)", duckdb.CatalogException),
+])
+def test_opt_in_propagates_real_sql_errors_after_logging(con, caplog, statement, error_type):
+    with pytest.raises(error_type):
+        safe_execute(con, "required-transform", statement, raise_on_error=True)
+    assert "required-transform" in caplog.text and "failed" in caplog.text
+
+
+def test_opt_in_still_allows_missing_optional_source(con):
+    safe_execute(con, "optional-source", "SELECT * FROM s.not_collected", raise_on_error=True)
+
+
+def test_default_still_logs_and_continues_after_binder_error(con, caplog):
+    safe_execute(con, "existing-consumer", "SELECT missing_column FROM (SELECT 1 AS actual_column)")
+    assert "existing-consumer" in caplog.text and "failed" in caplog.text
+
+
 def test_safe_execute_swallows_missing_table(con):
     """A missing source table (CatalogException) is swallowed, not raised."""
     # Must not raise even though s.absent does not exist.

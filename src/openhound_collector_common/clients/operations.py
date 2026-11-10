@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import socket
+import sys
 import time
 from collections.abc import Callable
 from contextvars import ContextVar, Token
@@ -227,7 +228,11 @@ class ReadOperation:
 
 
 def cancel_windows_call(thread_id: int) -> None:
-    """Request cancellation without joining the worker's Windows COM apartment."""
+    """Request Windows COM cancellation; raise RuntimeError on other platforms."""
+    if sys.platform != "win32":
+        logger.error("Windows COM cancellation is unavailable on this platform")
+        raise RuntimeError("Windows COM cancellation requires Windows")
+    # Normal Windows selection needs no extra log; cancellation diagnostics stay below.
     import ctypes
 
     cancel = ctypes.WinDLL("ole32").CoCancelCall
