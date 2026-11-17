@@ -18,7 +18,8 @@ class _Socks5EchoStub:
     reading and echoing so a test can prove data flows through the tunnel.
     """
 
-    def __init__(self):
+    def __init__(self, reply_code=0):
+        self.reply_code = reply_code
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(1)
@@ -53,8 +54,10 @@ class _Socks5EchoStub:
             else:
                 conn.recv(16)
             conn.recv(2)  # port
-            # reply: success, bound 0.0.0.0:0
-            conn.sendall(bytes([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+            # Reply with the selected outcome and bound address 0.0.0.0:0.
+            conn.sendall(bytes([0x05, self.reply_code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+            if self.reply_code:
+                return  # A failed CONNECT never starts a tunneled byte stream.
             while True:
                 data = conn.recv(4096)
                 if not data:

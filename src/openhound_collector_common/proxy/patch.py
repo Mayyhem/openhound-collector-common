@@ -119,9 +119,12 @@ class _ProxiedSocket(_ORIG_SOCKET):  # type: ignore[misc,valid-type]
         except TimeoutError as error:
             logger.warning("SOCKS connection deadline expired: %s", error)
             return errno.ETIMEDOUT
-        except (OSError, SocksError) as error:
+        except OSError as error:
             logger.warning("SOCKS connection failed: %s", error)
-            return getattr(error, "errno", None) or errno.ECONNREFUSED
+            return error.errno or errno.EIO
+        except SocksError as error:
+            logger.warning("SOCKS negotiation failed: %s", error)
+            return errno.EIO
         return 0
 
 

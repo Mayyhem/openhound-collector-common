@@ -25,6 +25,7 @@ right default for tunneling into a network you can't resolve locally.
 """
 from __future__ import annotations
 
+import errno
 import ipaddress
 import logging
 import socket
@@ -59,6 +60,14 @@ _REPLY_MESSAGES = {
     0x06: "TTL expired",
     0x07: "command not supported",
     0x08: "address type not supported",
+}
+
+# Only these replies describe an unavailable destination. Proxy policy, sign-in
+# and protocol failures must not be mistaken for a host with no SQL listener.
+_DESTINATION_ERROR_NUMBERS = {
+    0x03: errno.ENETUNREACH,
+    0x04: errno.EHOSTUNREACH,
+    0x05: errno.ECONNREFUSED,
 }
 
 
@@ -160,8 +169,9 @@ def socks5_handshake(
     """Run the SOCKS5 greeting/auth + CONNECT on an already-open socket.
 
     *sock* must already be connected to the proxy endpoint. On return it is a
-    live tunnel to ``(dest_host, dest_port)``. Raises :class:`SocksError` on any
-    protocol failure (the caller owns closing the socket).
+    live tunnel to ``(dest_host, dest_port)``. Refused or unreachable destinations
+    raise :class:`OSError`; other proxy/protocol failures raise :class:`SocksError`.
+    The caller owns closing the socket after either kind of failure.
     """
     _socks5_negotiate_auth(sock, proxy)
     _socks5_connect(sock, dest_host, dest_port)
@@ -178,8 +188,9 @@ def connect_through_socks5(
 
     Returns the connected socket (already past the SOCKS5 handshake), which the
     caller uses as a normal stream socket to the destination. On any protocol or
-    connection failure the partially-opened socket is closed and a
-    :class:`SocksError` is raised.
+    connection failure the partially-opened socket is closed. Refused or
+    unreachable destinations raise :class:`OSError`; proxy/protocol failures
+    raise :class:`SocksError`.
     """
     sock = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
     try:
@@ -276,10 +287,9 @@ def _socks5_connect(sock: socket.socket, dest_host: str, dest_port: int) -> None
     header = _recv_exact(sock, 4)
     if header[0] != _SOCKS_VERSION:
         raise SocksError(f"proxy reply has non-SOCKS5 version {header[0]:#x}")
-    if header[1] != _REP_SUCCEEDED:
-        # Map the reply code to a readable message.
-        reason = _REPLY_MESSAGES.get(header[1], f"unknown error {header[1]:#x}")
-        raise SocksError(f"SOCKS5 CONNECT failed: {reason}")
+    if header[2] != _RSV:
+        logger.warning("SOCKS proxy reply has a nonzero reserved field")
+        raise SocksError("proxy reply has a nonzero reserved field")
 
     # Drain the bound address that follows, sized by its ATYP, so the socket is
     # left positioned exactly at the start of the tunneled stream.
@@ -296,6 +306,20 @@ def _socks5_connect(sock: socket.socket, dest_host: str, dest_port: int) -> None
         raise SocksError(f"proxy reply has unknown address type {atyp:#x}")
     # Followed by a 2-byte bound port we don't need but must consume.
     _recv_exact(sock, 2)
+
+    # Validate the complete reply before treating it as evidence about the
+    # destination. A broken or truncated proxy reply is not a refused SQL port.
+    if header[1] != _REP_SUCCEEDED:
+        reason = _REPLY_MESSAGES.get(header[1], f"unknown error {header[1]:#x}")
+        message = f"SOCKS5 CONNECT to {dest_host}:{dest_port} failed: {reason}"
+        error_number = _DESTINATION_ERROR_NUMBERS.get(header[1])
+        if error_number is not None:
+            logger.debug("%s", message)
+            # Python gives connection refusal its normal ConnectionRefusedError
+            # type, so callers can use the same handlers as a direct connection.
+            raise OSError(error_number, message)
+        logger.warning("%s", message)
+        raise SocksError(message)
     logger.debug("_socks5_connect: CONNECT to %s:%s succeeded", dest_host, dest_port)
 
 

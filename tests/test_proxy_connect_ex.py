@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import socket
 import time
 from threading import Event, Thread
@@ -64,7 +65,7 @@ def test_failed_or_stalled_proxy_returns_failure_without_a_direct_retry(reject):
                 result = connection.connect_ex(
                     ("must-not-connect-directly.invalid", 1433)
                 )
-                assert result != 0
+                assert result == (errno.EIO if reject else errno.ETIMEDOUT)
                 assert time.monotonic() - started < 2
                 if connection.fileno() != -1:
                     assert connection.gettimeout() == 0
