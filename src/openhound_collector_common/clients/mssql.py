@@ -219,40 +219,19 @@ class Target:
 
 
 def parse_target(target: str) -> Target:
-    """Parse ``host`` / ``host:port`` / ``host\\instance`` / SPN into a Target.
+    """Require a known TCP endpoint before any connection or EPA probe.
 
-    Mirrors Go ``parseServerInstance``: an ``MSSQLSvc/`` SPN prefix is stripped,
-    ``host\\instance`` keeps the instance (port left at default — SQL Browser
-    resolution is out of scope here), and ``host:port`` overrides the port.
+    Discovery may retain an unresolved instance name. The connection client must
+    receive its resolved port rather than accidentally contact the default engine.
     """
-    spec = target.strip()
-    if spec.upper().startswith("MSSQLSVC/"):
-        # SPN form MSSQLSvc/host:port — drop the service-class prefix.
-        spec = spec[len("MSSQLSVC/") :]
-    if "\\" in spec:
-        # host\instance (optionally with :port on the instance).
-        host, rest = spec.split("\\", 1)
-        if ":" in rest:
-            instance, port_str = rest.rsplit(":", 1)
-            return Target(host=host, port=_to_port(port_str), instance=instance)
-        return Target(host=host, instance=rest)
-    if ":" in spec:
-        # host:port.
-        host, port_str = spec.rsplit(":", 1)
-        return Target(host=host, port=_to_port(port_str))
-    # Bare hostname.
-    return Target(host=spec)
+    from ..discovery.sql_server import parse_sql_address
 
-
-def _to_port(text: str) -> int:
-    """Parse a port string, falling back to the default on garbage."""
-    try:
-        return int(text)
-    except ValueError:
-        logger.warning(
-            "Invalid port %r in target; using default %d", text, DEFAULT_PORT
-        )
-        return DEFAULT_PORT
+    address = parse_sql_address(target)
+    if address.port is None:
+        logger.warning("SQL target has no known TCP port; resolve its instance first")
+        raise ValueError("Resolve the SQL instance or supply its TCP port before connecting")
+    # All accepted targets have a validated numeric port.
+    return Target(address.host, address.port, address.instance)
 
 
 def default_spn(host: str, port: int) -> str:
@@ -1288,6 +1267,7 @@ class _ProbeOutcome:
     encryption_flag: int = ENCRYPT_OFF
     is_strict: bool = False
     error_message: str = ""
+    instance_name: str | None = None
 
 
 def detect_epa(
@@ -1296,6 +1276,7 @@ def detect_epa(
     *,
     timeout: int = 15,
     read_control: ReadControl | None = None,
+    identify_instance: bool = False,
 ) -> dict:
     """Determine EPA enforcement for *target* using *auth* (LDAP/domain creds).
 
@@ -1310,6 +1291,11 @@ def detect_epa(
     indistinguishable (the uncertainty is surfaced verbatim — see memory
     ``feedback_epa_uncertainty_label``).
 
+    ``identify_instance`` adds ``instanceName``: the engine's reported name,
+    ``MSSQLSERVER`` for its default instance, or None when it could not be read.
+    Only a successful normal login runs that read, on its existing connection.
+    A failed identity read does not change the independent protection verdict.
+
     Raises :class:`EPAPrereqError` if the baseline (correct-bindings) login does
     not cleanly succeed or "login failed", because then the manipulated-binding
     probes cannot be trusted. Also raises if a required manipulated-binding
@@ -1318,11 +1304,18 @@ def detect_epa(
     parsed = parse_target(target)
     spn = auth.spn or default_spn(parsed.host, parsed.port)
     auth_method = "sspi" if auth.use_sspi else "explicit"
-    probe = (
-        _make_prober(parsed, auth, spn, timeout=timeout, read_control=read_control)
-        if read_control is not None
-        else _make_prober(parsed, auth, spn, timeout=timeout)
-    )
+    if identify_instance:
+        # Reuse the successful normal login, rather than sending another sign-in
+        # just to learn which engine answered the fallback port.
+        probe = _make_prober(
+            parsed, auth, spn, timeout=timeout, read_control=read_control,
+            identify_instance=True,
+        )
+    elif read_control is not None:
+        probe = _make_prober(parsed, auth, spn, timeout=timeout, read_control=read_control)
+    else:
+        # Ordinary EPA callers do not request an additional SQL read.
+        probe = _make_prober(parsed, auth, spn, timeout=timeout)
 
     normal = probe("normal")
     # Prereq: baseline must authenticate or fail with a plain "login failed".
@@ -1362,6 +1355,9 @@ def detect_epa(
         "encryptionFlag": normal.encryption_flag,
         "unmodifiedSuccess": normal.success,
     }
+    if identify_instance:
+        verdict["instanceName"] = normal.instance_name
+    # Keep the existing result shape for callers that did not request identity.
     logger.info("EPA verdict for %s: %s", target, verdict)
     return verdict
 
@@ -1414,6 +1410,7 @@ def _make_prober(
     *,
     timeout: int,
     read_control: ReadControl | None = None,
+    identify_instance: bool = False,
 ) -> Callable[[str], _ProbeOutcome]:
     """Return a ``probe(mode)`` that runs one EPA login probe on a fresh conn.
 
@@ -1459,8 +1456,26 @@ def _make_prober(
             enc, strict = client.epa_encryption_flag, client.epa_is_strict
             if authenticated:
                 logger.debug("EPA probe %s on %s: success", mode, target.host)
+                instance_name = None
+                if identify_instance and mode == "normal":
+                    from ..discovery.sql_fallback import SQL_INSTANCE_QUERY, sql_instance_name
+
+                    try:
+                        with _tds_operation(client, read_control, "SQL instance identity"):
+                            rows = client.RunSQLQuery(None, SQL_INSTANCE_QUERY)
+                        if len(rows) != 1:
+                            raise ValueError("SQL instance identity needs exactly one row")
+                        instance_name = sql_instance_name(rows[0])
+                    except (ReadStoppedError, ClientCleanupError):
+                        logger.warning("SQL instance identity read stopped")
+                        raise
+                    except Exception as error:
+                        logger.warning("SQL instance name on %s:%s remains unknown: %s", target.host, target.port, error)
+                # Modified-binding probes never run catalog queries. An unread
+                # name does not invalidate an independently measured EPA result.
                 return _ProbeOutcome(
-                    success=True, encryption_flag=enc, is_strict=strict
+                    success=True, encryption_flag=enc, is_strict=strict,
+                    instance_name=instance_name,
                 )
             outcome = _classify_error_text(client.get_error_messages())
             outcome.encryption_flag = enc
@@ -1470,6 +1485,9 @@ def _make_prober(
             )
             return outcome
         except Exception as ex:  # noqa: BLE001 — one bad probe must not abort all
+            if isinstance(ex, ClientCleanupError):
+                logger.error("SQL EPA identity cleanup failed; the run must fail")
+                raise
             if isinstance(ex, ReadStoppedError) or (
                 operation is not None and operation.is_stopped
             ):

@@ -39,6 +39,8 @@ and hash logins passed in both consumer environments; full acceptance remains pe
 | `discovery/dns.py` | DC/SRV/A discovery + DNS resolver override (proxy-aware). |
 | `discovery/network.py` | Run-wide forward/reverse DNS and SOCKS selection, exact socket restoration, and TCP reachability checks. |
 | `discovery/domain.py` | Explicit/credential/Windows domain selection and target suffixes verified through LDAP DNS records. |
+| `discovery/sql_server.py` | Strict SQL address/SPN parsing; unresolved instance names retain an unknown port. |
+| `discovery/sql_browser.py` | Specific-instance UDP port resolution, validated replies, inherited read controls and a per-run cache. |
 | `clients/deadline.py` | Opt-in elapsed-time socket deadline shared across connection attempts; interrupts a stalled peer without terminating worker threads. |
 | `dlt/progress.py` | Shared `off`, `tqdm`, `log`, and `alive_progress` choices; preserves SCCM's existing tracker behavior. |
 | `dlt/source_bridge.py` | push→pull DLT emit-resource bridge for multi-target collection. |
@@ -60,6 +62,36 @@ and hash logins passed in both consumer environments; full acceptance remains pe
 | `integration_testing/` | Collector-agnostic assert-and-diff engine: payload loader (dir or zip), pattern matcher, fixture case runner, schema coverage, property-level comparator, independent requested checks, and HTML/JSON case reports. |
 
 ## Consumers
+
+SQL discovery is shared by the SCCM and MSSQL collectors. `parse_sql_address`
+returns a `SqlAddress` with `port=None` for an unresolved named instance or a
+registration without a numeric TCP port. A bare connection hostname still requests
+1433. Invalid numeric ports raise `ValueError`. The connection client's
+`parse_target` now rejects an unresolved instance rather than contacting 1433.
+Call `SqlBrowserResolver.resolve(host, instance, timeout=3)` first or supply a
+known port. Browser uses UDP/1434 and refuses `proxied=True`; the caller decides
+whether and when to request discovery. Graph identifiers, account evidence,
+SCCM topology and permission rules stay in the collectors.
+
+Both collectors can separately try the conventional port when resolution fails.
+`SqlPortFallback` reserves an anonymous `SqlAddress(host, 1433)` once per host for
+one run; `remember` covers known 1433 endpoints first. Pass the already collected
+computer SID as `host_identity` to cover hostname aliases without extra lookups.
+This helper opens no socket and never replaces an unresolved named address.
+Callers use their existing proxy-aware TCP clients and enforce scope and methods.
+`sql_instance_name` validates the answering engine's `ServerName`/`InstanceName`
+SQL properties; it returns `MSSQLSERVER` for a confirmed default engine and raises
+for unread/inconsistent identity. `detect_epa(..., identify_instance=True)` can
+read those properties on its existing successful normal login and adds an optional
+`instanceName` result. A failed name read leaves an independent protection verdict
+usable. See the [fallback design and checks](docs/changes/2026-11-17-sql-port-fallback.md).
+
+Browser instance names are limited to 32 encoded bytes. Its default ASCII subset
+works across Windows code pages; code that knows the common server/client code
+page can pass `encoding='cp1252'`, for example. It does not guess a remote code
+page from the operating system running the collector. Unrelated localized
+response values do not require ASCII decoding. See the
+[design and checks](docs/changes/2026-11-10-sql-instance-discovery.md).
 
 SQL protection detection raises `EPAPrereqError` when a required probe times out,
 fails in transport, or returns an unrecognized authentication result. Such a
@@ -387,6 +419,16 @@ immediate return still waits for the bounded SOCKS handshake; its original mode
 is restored on success. DNS uses TCP inside the same proxy session. Connections
 to local loopback listeners and the proxy's own endpoint retain their local
 exception; other ports on the proxy host remain proxied.
+
+When SOCKS explicitly reports network unreachable, host unreachable or connection
+refused, the dialer raises the ordinary `OSError` with the matching error number
+(`ENETUNREACH`, `EHOSTUNREACH`, or `ECONNREFUSED`). The message keeps the destination
+and the proxy's reason. This lets a collector handle a closed port just as it
+does without a proxy. `connect_ex` returns that same error number instead of
+raising. Proxy authentication, policy, server and malformed-reply failures remain
+`SocksError`; `connect_ex` reports those as `EIO` and logs the specific reason.
+The complete reply is checked before any destination error is accepted. No
+failure triggers a direct connection retry.
 
 You need a **system Python 3.13 or 3.14 on `PATH`**, plus [`uv`](https://docs.astral.sh/uv/).
 `pyproject.toml` sets `python-preference = "only-system"`, so uv will not download an interpreter for
